@@ -1063,34 +1063,60 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
     
     logger.info(f":white_check_mark: Webhook accepted, queuing for processing")
     
-    # Convert organization_id to int if it's a string
-    org_id_raw = ticket_detail.get("organization_id")
-    org_id = None
-    if org_id_raw:
-        try:
-            org_id = int(org_id_raw) if isinstance(org_id_raw, str) else org_id_raw
-        except (ValueError, TypeError):
-            logger.warning(f":warning: Invalid organization_id format: {org_id_raw}, setting to None")
-            org_id = None
-    
-    # Normalize payload to expected format for process_ticket_event
-    normalized_payload = {
-        "event_type": event_type,
-        "ticket": {
-            "id": ticket_id,
-            "status": ticket_detail.get("status"),
-            "subject": ticket_detail.get("subject"),
-            "description": ticket_detail.get("description"),
-            "tags": ticket_detail.get("tags", []),
-            "organization_id": org_id
+    # Fetch fresh ticket data from Zendesk to ensure current status
+    # Webhooks can send stale data or be triggered at the wrong time
+    try:
+        logger.info(f":mag: Fetching current ticket data from Zendesk for ticket #{ticket_id}")
+        fresh_ticket = zendesk_client.get_ticket(ticket_id)
+        
+        # Use fresh data from Zendesk, not webhook payload
+        normalized_payload = {
+            "event_type": event_type,
+            "ticket": {
+                "id": fresh_ticket.id,
+                "status": fresh_ticket.status,
+                "subject": fresh_ticket.subject,
+                "description": fresh_ticket.description,
+                "tags": fresh_ticket.tags,
+                "organization_id": fresh_ticket.organization_id
+            }
         }
-    }
+        logger.info(f":white_check_mark: Fetched fresh ticket data - Current status: {fresh_ticket.status}")
+    except Exception as e:
+        logger.error(f":x: Failed to fetch fresh ticket data from Zendesk: {e}")
+        logger.warning(f":warning: Falling back to webhook payload data")
+        
+        # Fallback to webhook payload if Zendesk fetch fails
+        org_id_raw = ticket_detail.get("organization_id")
+        org_id = None
+        if org_id_raw:
+            try:
+                org_id = int(org_id_raw) if isinstance(org_id_raw, str) else org_id_raw
+            except (ValueError, TypeError):
+                logger.warning(f":warning: Invalid organization_id format: {org_id_raw}, setting to None")
+                org_id = None
+        
+        normalized_payload = {
+            "event_type": event_type,
+            "ticket": {
+                "id": ticket_id,
+                "status": ticket_detail.get("status"),
+                "subject": ticket_detail.get("subject"),
+                "description": ticket_detail.get("description"),
+                "tags": ticket_detail.get("tags", []),
+                "organization_id": org_id
+            }
+        }
     
-    background_tasks.add_task(
-        webhook_handler.process_ticket_event,
-        normalized_payload,
-        zendesk_subdomain
-    )
+    # Wrapper to catch background task errors
+    async def safe_process_ticket():
+        try:
+            await webhook_handler.process_ticket_event(normalized_payload, zendesk_subdomain)
+        except Exception as e:
+            logger.error(f":x: Background task error processing ticket #{ticket_id}: {e}")
+            logger.exception("Full traceback:")
+    
+    background_tasks.add_task(safe_process_ticket)
     
     return JSONResponse(
         status_code=200,
