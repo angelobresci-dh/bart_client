@@ -619,17 +619,23 @@ class ZendeskWebhookHandler:
         tags = ticket.get("tags", [])
         organization_id = ticket.get("organization_id")
         
+        logger.info(f":label: Extracted {len(tags)} tags from ticket: {tags[:5]}{'...' if len(tags) > 5 else ''}")
+        logger.info(f":building_construction: Organization ID: {organization_id}")
+        
         # Fetch organization name if available
         organization_name = None
         if organization_id:
             try:
                 org = self.zendesk.get_organization(organization_id)
                 organization_name = org.name if org else None
+                if organization_name:
+                    logger.info(f":building_construction: Organization name: {organization_name}")
             except Exception as e:
                 logger.warning(f":warning: Failed to fetch organization {organization_id}: {e}")
         
         # Detect deployment type
         deployment_type = self.detect_deployment_type(tags)
+        logger.info(f":computer: Detected deployment type: {deployment_type}")
         
         # Build ticket URL
         ticket_url = f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
@@ -667,7 +673,7 @@ Instructions for your response:
         """Determine if this ticket should be processed by Bart"""
         ticket = payload.get("ticket", {})
         ticket_id = ticket.get("id")
-        status = ticket.get("status", "")
+        status = ticket.get("status", "").lower()  # Convert to lowercase for comparison
         
         if status in ["closed", "solved"]:
             logger.info(f":black_right_pointing_double_triangle_with_vertical_bar: Skipping ticket {ticket_id} - status is {status}")
@@ -998,15 +1004,46 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
         logger.error(f":x: Failed to parse webhook payload: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
     
-    event_type = payload.get("event_type", "unknown")
-    ticket = payload.get("ticket", {})
-    ticket_id = ticket.get("id", "unknown")
-    ticket_status = ticket.get("status", "unknown")
+    # Log the raw payload structure for debugging
+    logger.info(f":mag: Raw webhook payload keys: {list(payload.keys())}")
+    
+    # Extract event type from Zendesk's actual structure
+    # Format: "zen:event-type:ticket.created" or "zen:event-type:ticket.updated"
+    event_type_raw = payload.get("type", "unknown")
+    if event_type_raw.startswith("zen:event-type:"):
+        event_type = event_type_raw.replace("zen:event-type:", "")
+    else:
+        event_type = event_type_raw
+    
+    # Extract ticket data from 'detail' field (Zendesk's actual structure)
+    ticket_detail = payload.get("detail", {})
+    
+    if not ticket_detail:
+        logger.error(f":x: No 'detail' field found in webhook payload")
+        logger.error(f"   Available keys: {list(payload.keys())}")
+        raise HTTPException(status_code=400, detail="Missing 'detail' field in webhook payload")
+    
+    # Extract ticket ID (may be string or int)
+    ticket_id_raw = ticket_detail.get("id")
+    if not ticket_id_raw:
+        logger.error(f":x: No ticket ID found in detail field")
+        raise HTTPException(status_code=400, detail="Missing ticket ID in webhook payload")
+    
+    # Convert to int if it's a string
+    try:
+        ticket_id = int(ticket_id_raw) if isinstance(ticket_id_raw, str) else ticket_id_raw
+    except (ValueError, TypeError):
+        logger.error(f":x: Invalid ticket ID format: {ticket_id_raw}")
+        raise HTTPException(status_code=400, detail=f"Invalid ticket ID: {ticket_id_raw}")
+    
+    ticket_status = ticket_detail.get("status", "unknown")
+    ticket_subject = ticket_detail.get("subject", "")
     
     logger.info(f":mailbox_with_mail: ===== WEBHOOK RECEIVED =====")
     logger.info(f":mailbox_with_mail: Event Type: {event_type}")
     logger.info(f":mailbox_with_mail: Ticket ID: {ticket_id}")
     logger.info(f":mailbox_with_mail: Ticket Status: {ticket_status}")
+    logger.info(f":mailbox_with_mail: Subject: {ticket_subject[:80]}")
     logger.info(f":mailbox_with_mail: Trigger: Zendesk webhook")
     
     # Check if ticket was recently processed
@@ -1026,9 +1063,32 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
     
     logger.info(f":white_check_mark: Webhook accepted, queuing for processing")
     
+    # Convert organization_id to int if it's a string
+    org_id_raw = ticket_detail.get("organization_id")
+    org_id = None
+    if org_id_raw:
+        try:
+            org_id = int(org_id_raw) if isinstance(org_id_raw, str) else org_id_raw
+        except (ValueError, TypeError):
+            logger.warning(f":warning: Invalid organization_id format: {org_id_raw}, setting to None")
+            org_id = None
+    
+    # Normalize payload to expected format for process_ticket_event
+    normalized_payload = {
+        "event_type": event_type,
+        "ticket": {
+            "id": ticket_id,
+            "status": ticket_detail.get("status"),
+            "subject": ticket_detail.get("subject"),
+            "description": ticket_detail.get("description"),
+            "tags": ticket_detail.get("tags", []),
+            "organization_id": org_id
+        }
+    }
+    
     background_tasks.add_task(
         webhook_handler.process_ticket_event,
-        payload,
+        normalized_payload,
         zendesk_subdomain
     )
     
