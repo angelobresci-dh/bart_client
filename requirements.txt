@@ -1,0 +1,8 @@
+fastapi 
+uvicorn 
+slack-bolt 
+slack-sdk 
+python-dotenv 
+httpx 
+zenpy 
+pyngrok
