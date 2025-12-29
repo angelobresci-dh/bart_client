@@ -698,8 +698,16 @@ Instructions for your response:
         
         return True
     
-    async def process_ticket_event(self, payload: Dict[str, Any], zendesk_subdomain: str) -> Dict[str, Any]:
-        """Process a Zendesk ticket create/update event"""
+    async def process_ticket_event(self, payload: Dict[str, Any], zendesk_subdomain: str, add_comment: bool = True) -> Dict[str, Any]:
+        """
+        Process a Zendesk ticket create/update event
+        
+        Args:
+            payload: Zendesk ticket payload
+            zendesk_subdomain: Zendesk subdomain for building URLs
+            add_comment: If True, add Bart's response as a comment to the Zendesk ticket.
+                        If False, only return the response in the result dict (default: True)
+        """
         # Generate unique request ID for tracking
         request_id = str(uuid.uuid4())[:8]
         
@@ -780,12 +788,17 @@ Instructions for your response:
             if slack_thread_url:
                 formatted_response += f"\n\n:speech_balloon: [View conversation in Slack]({slack_thread_url})"
             
-            # Update Zendesk ticket with Bart's response (private comment)
-            self.zendesk.add_comment(
-                ticket_id=response_ticket_id,
-                comment_text=formatted_response,
-                public=False
-            )
+            # Conditionally update Zendesk ticket with Bart's response
+            if add_comment:
+                logger.info(f":memo: [{request_id}] Adding comment to Zendesk ticket #{response_ticket_id}")
+                self.zendesk.add_comment(
+                    ticket_id=response_ticket_id,
+                    comment_text=formatted_response,
+                    public=False
+                )
+                logger.info(f":white_check_mark: [{request_id}] Comment added to Zendesk ticket")
+            else:
+                logger.info(f":information_source: [{request_id}] Skipping Zendesk comment (add_comment=False)")
             
             logger.info(f":white_check_mark: [{request_id}] Successfully processed ticket #{ticket_id}")
             logger.info(f"{'='*80}")
@@ -796,7 +809,11 @@ Instructions for your response:
                 "ticket_id": ticket_id,
                 "deployment_type": deployment_type,
                 "response_length": len(bart_response),
-                "processing_time_seconds": elapsed
+                "processing_time_seconds": elapsed,
+                "response": bart_response,  # Always include response text
+                "formatted_response": formatted_response,  # Include formatted version
+                "slack_thread_url": slack_thread_url,
+                "comment_added": add_comment
             }
         
         except ValueError as e:
@@ -817,34 +834,42 @@ Instructions for your response:
         except TimeoutError as e:
             logger.error(f":alarm_clock: [{request_id}] Timeout processing ticket #{ticket_id}: {e}")
             timeout_minutes = self.bart.default_timeout / 60
-            self.zendesk.add_comment(
-                ticket_id=ticket_id,
-                comment_text=(
-                    f":alarm_clock: Bart took too long to respond (timeout after {timeout_minutes:.0f} minutes). "
-                    f"This might be a complex question. Please try asking again or reach out to support."
-                ),
-                public=False
-            )
+            
+            if add_comment:
+                self.zendesk.add_comment(
+                    ticket_id=ticket_id,
+                    comment_text=(
+                        f":alarm_clock: Bart took too long to respond (timeout after {timeout_minutes:.0f} minutes). "
+                        f"This might be a complex question. Please try asking again or reach out to support."
+                    ),
+                    public=False
+                )
+            
             return {
                 "status": "timeout",
                 "ticket_id": ticket_id,
-                "error": str(e)
+                "error": str(e),
+                "comment_added": add_comment
             }
         
         except Exception as e:
             logger.error(f":x: [{request_id}] Error processing ticket #{ticket_id}: {e}")
-            self.zendesk.add_comment(
-                ticket_id=ticket_id,
-                comment_text=(
-                    f":x: Bart encountered an error while processing your question: {str(e)}\n"
-                    f"A human agent will follow up shortly."
-                ),
-                public=False
-            )
+            
+            if add_comment:
+                self.zendesk.add_comment(
+                    ticket_id=ticket_id,
+                    comment_text=(
+                        f":x: Bart encountered an error while processing your question: {str(e)}\n"
+                        f"A human agent will follow up shortly."
+                    ),
+                    public=False
+                )
+            
             return {
                 "status": "error",
                 "ticket_id": ticket_id,
-                "error": str(e)
+                "error": str(e),
+                "comment_added": add_comment
             }
 
 
@@ -990,7 +1015,18 @@ async def health_check():
 
 @app.post("/zendesk/webhook")
 async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Zendesk webhook endpoint"""
+    """
+    Zendesk webhook endpoint
+    
+    Accepts webhook payloads from Zendesk and processes tickets with Bart.
+    
+    Request body can include optional 'add_comment' field:
+    {
+        "type": "zen:event-type:ticket.created",
+        "detail": { ... ticket data ... },
+        "add_comment": false  // Optional: default is true
+    }
+    """
     body = await request.body()
     signature = request.headers.get("X-Zendesk-Webhook-Signature", "")
     
@@ -1003,6 +1039,9 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
     except Exception as e:
         logger.error(f":x: Failed to parse webhook payload: {e}")
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
+    
+    # Extract add_comment parameter from request body (default: True)
+    add_comment = payload.get("add_comment", True)
     
     # Log the raw payload structure for debugging
     logger.info(f":mag: Raw webhook payload keys: {list(payload.keys())}")
@@ -1045,6 +1084,7 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
     logger.info(f":mailbox_with_mail: Ticket Status: {ticket_status}")
     logger.info(f":mailbox_with_mail: Subject: {ticket_subject[:80]}")
     logger.info(f":mailbox_with_mail: Trigger: Zendesk webhook")
+    logger.info(f":memo: add_comment parameter: {add_comment}")
     
     # Check if ticket was recently processed
     if bart_client.was_recently_processed(ticket_id):
@@ -1111,7 +1151,8 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
     # Wrapper to catch background task errors
     async def safe_process_ticket():
         try:
-            await webhook_handler.process_ticket_event(normalized_payload, zendesk_subdomain)
+            # Pass add_comment from webhook request body
+            await webhook_handler.process_ticket_event(normalized_payload, zendesk_subdomain, add_comment=add_comment)
         except Exception as e:
             logger.error(f":x: Background task error processing ticket #{ticket_id}: {e}")
             logger.exception("Full traceback:")
@@ -1122,14 +1163,26 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
         status_code=200,
         content={
             "status": "accepted",
-            "message": f"Ticket #{ticket_id} queued for processing"
+            "ticket_id": ticket_id,
+            "add_comment": add_comment,
+            "message": f"Ticket #{ticket_id} queued for processing" + ("" if add_comment else " (comment will NOT be added to Zendesk)")
         }
     )
 
 
 @app.get("/zendesk/ticket/{ticket_id}")
-async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks):
-    """GET endpoint to process a Zendesk ticket by ID"""
+async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks, add_comment: bool = True):
+    """
+    GET endpoint to process a Zendesk ticket by ID
+    
+    Args:
+        ticket_id: Zendesk ticket ID
+        add_comment: If True, add Bart's response to Zendesk ticket. If False, only return in response (default: True)
+    
+    Example:
+        GET /zendesk/ticket/12345              # Adds comment (default)
+        GET /zendesk/ticket/12345?add_comment=false  # Only returns response, no comment
+    """
     try:
         logger.info(f":inbox_tray: ===== GET REQUEST RECEIVED =====")
         logger.info(f":inbox_tray: Ticket ID: {ticket_id}")
@@ -1166,12 +1219,14 @@ async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks):
         }
         
         logger.info(f":white_check_mark: Fetched ticket #{ticket_id}: {ticket.subject}")
+        logger.info(f":memo: add_comment parameter: {add_comment}")
         logger.info(f":white_check_mark: GET request accepted, queuing for processing")
         
         background_tasks.add_task(
             webhook_handler.process_ticket_event,
             payload,
-            zendesk_subdomain
+            zendesk_subdomain,
+            add_comment
         )
         
         return JSONResponse(
@@ -1179,7 +1234,8 @@ async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks):
             content={
                 "status": "accepted",
                 "ticket_id": ticket_id,
-                "message": f"Ticket #{ticket_id} queued for processing with Bart"
+                "add_comment": add_comment,
+                "message": f"Ticket #{ticket_id} queued for processing with Bart" + ("" if add_comment else " (comment will NOT be added to Zendesk)")
             }
         )
     except Exception as e:
@@ -1189,13 +1245,25 @@ async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks):
 
 @app.post("/zendesk/test")
 async def test_bart_question(request: Request):
-    """Test endpoint for asking Bart questions directly"""
+    """
+    Test endpoint for asking Bart questions directly
+    
+    Body:
+        {
+            "subject": "Test subject",
+            "description": "Test description",
+            "ticket_id": 12345,           // Optional: ticket ID to update
+            "tags": ["on_premise"],       // Optional: tags for deployment type detection
+            "add_comment": true           // Optional: whether to add comment to Zendesk (default: true)
+        }
+    """
     try:
         data = await request.json()
         subject = data.get("subject", "")
         description = data.get("description", "")
         ticket_id = data.get("ticket_id")
         tags = data.get("tags", [])
+        add_comment = data.get("add_comment", True)  # Default to True for backward compatibility
         
         if not subject and not description:
             raise HTTPException(status_code=400, detail="Missing 'subject' or 'description' field")
@@ -1230,14 +1298,20 @@ async def test_bart_question(request: Request):
             if slack_thread_url:
                 formatted_response += f"\n\n:speech_balloon: [View conversation in Slack]({slack_thread_url})"
             
-            zendesk_client.add_comment(ticket_id, formatted_response, public=False)
+            # Conditionally add comment to Zendesk
+            if add_comment:
+                logger.info(f":memo: Adding test comment to Zendesk ticket #{ticket_id}")
+                zendesk_client.add_comment(ticket_id, formatted_response, public=False)
+            else:
+                logger.info(f":information_source: Skipping Zendesk comment (add_comment=False)")
         
         return {
             "status": "success",
             "question": question,
             "response": response,
             "deployment_type": webhook_handler.detect_deployment_type(tags),
-            "ticket_updated": ticket_id is not None,
+            "ticket_updated": ticket_id is not None and add_comment,
+            "comment_added": add_comment if ticket_id else False,
             "processing_time_seconds": elapsed,
             "slack_thread_url": slack_thread_url
         }
