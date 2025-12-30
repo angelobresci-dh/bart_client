@@ -964,16 +964,36 @@ def create_job(ticket_id: int, payload: Dict[str, Any]) -> str:
 
 
 def update_job(job_id: str, status: str, result: Dict[str, Any]):
-    """Update job with result"""
-    if job_id in jobs:
+    """
+    Update job with result
+    
+    Raises ValueError if job doesn't exist
+    """
+    try:
+        if job_id not in jobs:
+            error_msg = f"Cannot update job {job_id} - job not found in jobs dictionary"
+            logger.error(f":x: {error_msg}")
+            raise ValueError(error_msg)
+        
+        # Update the job
         jobs[job_id].update({
             "status": status,
             "result": result,
             "completed_at": time.time()
         })
+        
         logger.info(f":white_check_mark: Updated job {job_id} - status: {status}")
-    else:
-        logger.warning(f":warning: Attempted to update non-existent job {job_id}")
+        
+        # Verify the update actually happened
+        if jobs[job_id].get("status") != status:
+            logger.error(f":x: Job {job_id} status mismatch after update! Expected: {status}, Got: {jobs[job_id].get('status')}")
+            raise ValueError(f"Job status update verification failed")
+        
+        logger.info(f":white_check_mark: Verified job {job_id} status is now: {status}")
+        
+    except Exception as e:
+        logger.error(f":x: Failed to update job {job_id}: {e}")
+        raise
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -1083,11 +1103,13 @@ async def startup_event():
     
     base_url = public_url if public_url else f"http://localhost:{port}"
     logger.info(":mailbox_with_mail: Endpoints:")
-    logger.info(f"   Health Check:       GET  {base_url}/")
-    logger.info(f"   Zendesk Webhook:    POST {base_url}/zendesk/webhook")
-    logger.info(f"   Get Ticket:         GET  {base_url}/zendesk/ticket/{{ticket_id}}")
-    logger.info(f"   Test Endpoint:      POST {base_url}/zendesk/test")
-    logger.info(f"   Job Status:         GET  {base_url}/zendesk/job/{{job_id}}")
+    logger.info(f"   Health Check:       GET    {base_url}/")
+    logger.info(f"   Zendesk Webhook:    POST   {base_url}/zendesk/webhook")
+    logger.info(f"   Get Ticket:         GET    {base_url}/zendesk/ticket/{{ticket_id}}")
+    logger.info(f"   Test Endpoint:      POST   {base_url}/zendesk/test")
+    logger.info(f"   Job Status:         GET    {base_url}/zendesk/job/{{job_id}}")
+    logger.info(f"   List Jobs:          GET    {base_url}/zendesk/jobs (admin)")
+    logger.info(f"   Delete Job:         DELETE {base_url}/zendesk/job/{{job_id}} (admin)")
     logger.info("")
     logger.info(f":stopwatch:  Bart timeout: {bart_timeout:.0f} seconds ({bart_timeout/60:.1f} minutes)")
     logger.info(f":stopwatch:  Bart completion wait: {bart_completion_wait:.0f} seconds ({bart_completion_wait/60:.1f} minutes)")
@@ -1306,29 +1328,80 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
         
         # Wrapper to catch background task errors and update job
         async def safe_process_with_job():
+            job_updated = False  # Track if we've updated the job
+            
             try:
+                logger.info(f":robot_face: [{job_id}] Starting webhook processing...")
+                
                 result = await webhook_handler.process_ticket_event(
                     normalized_payload, 
                     zendesk_subdomain, 
                     add_comment=add_comment
                 )
                 
+                logger.info(f":white_check_mark: [{job_id}] process_ticket_event completed with status: {result.get('status')}")
+                
                 # Update job with result
-                if result["status"] == "success":
-                    update_job(job_id, "complete", result)
-                elif result["status"] == "skipped":
-                    update_job(job_id, "skipped", result)
-                else:
-                    update_job(job_id, "error", result)
+                try:
+                    if result["status"] == "success":
+                        logger.info(f":floppy_disk: [{job_id}] Updating job to 'complete'...")
+                        update_job(job_id, "complete", result)
+                        job_updated = True
+                    elif result["status"] == "skipped":
+                        logger.info(f":floppy_disk: [{job_id}] Updating job to 'skipped'...")
+                        update_job(job_id, "skipped", result)
+                        job_updated = True
+                    else:
+                        logger.info(f":floppy_disk: [{job_id}] Updating job to 'error'...")
+                        update_job(job_id, "error", result)
+                        job_updated = True
+                    
+                    logger.info(f":white_check_mark: [{job_id}] Job status updated successfully")
+                except Exception as update_error:
+                    logger.error(f":x: [{job_id}] Failed to update job status: {update_error}")
+                    logger.exception("Update job error:")
+                    # Don't set job_updated=True, let finally block handle it
                     
             except Exception as e:
-                logger.error(f":x: Background task error processing ticket #{ticket_id}: {e}")
+                logger.error(f":x: [{job_id}] Background task error processing ticket #{ticket_id}: {e}")
                 logger.exception("Full traceback:")
-                update_job(job_id, "error", {
-                    "status": "error",
-                    "error": str(e),
-                    "ticket_id": ticket_id
-                })
+                
+                try:
+                    update_job(job_id, "error", {
+                        "status": "error",
+                        "error": str(e),
+                        "ticket_id": ticket_id
+                    })
+                    job_updated = True
+                    logger.info(f":white_check_mark: [{job_id}] Job status updated to 'error' after exception")
+                except Exception as update_error:
+                    logger.error(f":x: [{job_id}] Failed to update job even in exception handler: {update_error}")
+                    # Don't set job_updated=True, let finally block handle it
+            
+            finally:
+                # CRITICAL: Ensure job is always updated
+                if not job_updated:
+                    logger.error(f":rotating_light: [{job_id}] CRITICAL: Job was not updated!")
+                    logger.error(f":rotating_light: [{job_id}] Forcing job status to 'error'")
+                    
+                    # Directly update jobs dictionary (don't call update_job to avoid circular failures)
+                    if job_id in jobs:
+                        try:
+                            jobs[job_id].update({
+                                "status": "error",
+                                "result": {
+                                    "status": "error",
+                                    "error": "Job processing completed but status was not updated (unexpected code path)",
+                                    "ticket_id": ticket_id
+                                },
+                                "completed_at": time.time()
+                            })
+                            logger.info(f":white_check_mark: [{job_id}] Job status force-updated in finally block")
+                        except Exception as final_error:
+                            logger.error(f":rotating_light: [{job_id}] FAILED to update job even in finally block: {final_error}")
+                    else:
+                        logger.error(f":rotating_light: [{job_id}] Job doesn't exist in jobs dictionary!")
+                        logger.error(f":rotating_light: [{job_id}] Job may have been deleted during processing")
         
         background_tasks.add_task(safe_process_with_job)
         
@@ -1515,6 +1588,21 @@ async def get_job_status(job_id: str):
     created_at = job.get("created_at")
     elapsed = int(time.time() - created_at)
     
+    # WARNING: If job is stuck in "processing" for >15 minutes, force to error
+    if job_status == "processing" and elapsed > 900:  # 15 minutes
+        logger.warning(f":warning: Job {job_id} stuck in 'processing' for {elapsed}s (>15 min)")
+        logger.warning(f":warning: Force-updating to 'error' state")
+        
+        update_job(job_id, "error", {
+            "status": "error",
+            "error": f"Job timed out - stuck in 'processing' state for {elapsed} seconds (>15 minutes). This likely indicates a background task failure.",
+            "ticket_id": ticket_id
+        })
+        
+        # Re-fetch updated job
+        job = get_job(job_id)
+        job_status = "error"
+    
     if job_status == "processing":
         return {
             "job_id": job_id,
@@ -1547,6 +1635,57 @@ async def get_job_status(job_id: str):
             "ticket_id": ticket_id,
             "message": "Unknown job status"
         }
+
+
+@app.delete("/zendesk/job/{job_id}")
+async def delete_job(job_id: str):
+    """
+    Admin endpoint to manually delete a job
+    
+    Useful for cleaning up stuck jobs or testing.
+    
+    Example:
+        DELETE /zendesk/job/abc-123-def
+    """
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    job = jobs.pop(job_id)
+    logger.info(f":wastebasket: Manually deleted job {job_id}")
+    
+    return {
+        "status": "deleted",
+        "job_id": job_id,
+        "was_status": job.get("status"),
+        "message": f"Job {job_id} deleted"
+    }
+
+
+@app.get("/zendesk/jobs")
+async def list_all_jobs():
+    """
+    Admin endpoint to list all jobs (for debugging)
+    
+    Example:
+        GET /zendesk/jobs
+    """
+    cleanup_old_jobs()
+    
+    jobs_list = []
+    for job_id, job in jobs.items():
+        elapsed = int(time.time() - job.get("created_at", time.time()))
+        jobs_list.append({
+            "job_id": job_id,
+            "status": job.get("status"),
+            "ticket_id": job.get("ticket_id"),
+            "elapsed_seconds": elapsed,
+            "created_at": datetime.fromtimestamp(job.get("created_at", time.time()), tz=timezone.utc).isoformat()
+        })
+    
+    return {
+        "total_jobs": len(jobs_list),
+        "jobs": jobs_list
+    }
 
 
 @app.post("/zendesk/test")
@@ -1676,6 +1815,7 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                 
                 request_id = str(uuid.uuid4())[:8]
                 start_time = time.time()
+                job_updated = False  # Track if we've updated the job
                 
                 try:
                     # Determine TTL
@@ -1687,6 +1827,7 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                         logger.info(f":stopwatch: [{job_id}] Using test endpoint TTL: {custom_ttl:.0f} seconds ({custom_ttl/60:.1f} minutes)")
                     
                     # Ask Bart
+                    logger.info(f":outbox_tray: [{job_id}] Calling bart_client.ask()...")
                     result = await bart_client.ask(
                         question, 
                         ticket_id=ticket_id or 99999, 
@@ -1698,9 +1839,11 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                     elapsed = time.time() - start_time
                     
                     logger.info(f":white_check_mark: [{job_id}] Bart responded in {elapsed:.1f} seconds")
+                    logger.info(f":white_check_mark: [{job_id}] Response length: {len(response)} characters")
                     
                     # Add comment if requested
                     if ticket_id and add_comment:
+                        logger.info(f":memo: [{job_id}] Adding comment to Zendesk ticket #{ticket_id}...")
                         formatted_response = (
                             f":robot_face: *Bart's Response (Test):*\n\n{response}\n\n"
                             f"---\n_Test response at {datetime.now(timezone.utc).isoformat()}Z_"
@@ -1712,38 +1855,83 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                         logger.info(f":white_check_mark: [{job_id}] Comment added to Zendesk")
                     
                     # Update job with success result
-                    update_job(job_id, "complete", {
-                        "status": "success",
-                        "response": response,
-                        "deployment_type": webhook_handler.detect_deployment_type(tags),
-                        "ticket_id": ticket_id,
-                        "ticket_updated": ticket_id is not None and add_comment,
-                        "comment_added": add_comment if ticket_id else False,
-                        "force_reprocess": force_reprocess,
-                        "processing_time_seconds": elapsed,
-                        "slack_thread_url": slack_thread_url
-                    })
+                    logger.info(f":floppy_disk: [{job_id}] Updating job status to 'complete'...")
+                    try:
+                        update_job(job_id, "complete", {
+                            "status": "success",
+                            "response": response,
+                            "deployment_type": webhook_handler.detect_deployment_type(tags),
+                            "ticket_id": ticket_id,
+                            "ticket_updated": ticket_id is not None and add_comment,
+                            "comment_added": add_comment if ticket_id else False,
+                            "force_reprocess": force_reprocess,
+                            "processing_time_seconds": elapsed,
+                            "slack_thread_url": slack_thread_url
+                        })
+                        job_updated = True
+                        logger.info(f":white_check_mark: [{job_id}] Job status updated to 'complete'")
+                    except Exception as update_error:
+                        logger.error(f":x: [{job_id}] Failed to update job status: {update_error}")
+                        logger.exception("Update job error:")
+                        # Don't set job_updated=True, let finally block handle it
                 
                 except ValueError as e:
                     # Deduplication error
                     error_msg = str(e)
                     logger.warning(f":warning: [{job_id}] Deduplication check failed: {error_msg}")
                     
-                    update_job(job_id, "skipped", {
-                        "status": "skipped",
-                        "error": error_msg,
-                        "ticket_id": ticket_id
-                    })
+                    try:
+                        update_job(job_id, "skipped", {
+                            "status": "skipped",
+                            "error": error_msg,
+                            "ticket_id": ticket_id
+                        })
+                        job_updated = True
+                        logger.info(f":white_check_mark: [{job_id}] Job status updated to 'skipped'")
+                    except Exception as update_error:
+                        logger.error(f":x: [{job_id}] Failed to update job to 'skipped': {update_error}")
+                        # Don't set job_updated=True, let finally block handle it
                 
                 except Exception as e:
                     logger.error(f":x: [{job_id}] Error in async processing: {e}")
                     logger.exception("Full traceback:")
                     
-                    update_job(job_id, "error", {
-                        "status": "error",
-                        "error": str(e),
-                        "ticket_id": ticket_id
-                    })
+                    try:
+                        update_job(job_id, "error", {
+                            "status": "error",
+                            "error": str(e),
+                            "ticket_id": ticket_id
+                        })
+                        job_updated = True
+                        logger.info(f":white_check_mark: [{job_id}] Job status updated to 'error'")
+                    except Exception as update_error:
+                        logger.error(f":x: [{job_id}] Failed to update job to 'error': {update_error}")
+                        # Don't set job_updated=True, let finally block handle it
+                
+                finally:
+                    # CRITICAL: Ensure job is always updated, even if update_job() itself fails
+                    if not job_updated:
+                        logger.error(f":rotating_light: [{job_id}] CRITICAL: Job was not updated by exception handlers!")
+                        logger.error(f":rotating_light: [{job_id}] Forcing job status to 'error' to prevent stuck 'processing' state")
+                        
+                        # Directly update jobs dictionary (don't call update_job to avoid circular failures)
+                        if job_id in jobs:
+                            try:
+                                jobs[job_id].update({
+                                    "status": "error",
+                                    "result": {
+                                        "status": "error",
+                                        "error": "Job processing completed but status was not updated (unexpected error path)",
+                                        "ticket_id": ticket_id
+                                    },
+                                    "completed_at": time.time()
+                                })
+                                logger.info(f":white_check_mark: [{job_id}] Job status force-updated to 'error' in finally block")
+                            except Exception as final_error:
+                                logger.error(f":rotating_light: [{job_id}] FAILED to update job even in finally block: {final_error}")
+                        else:
+                            logger.error(f":rotating_light: [{job_id}] Job doesn't exist in jobs dictionary!")
+                            logger.error(f":rotating_light: [{job_id}] Job may have been deleted or never created")
             
             # Start background processing
             background_tasks.add_task(process_with_job_updates)
