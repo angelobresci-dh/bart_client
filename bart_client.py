@@ -1293,29 +1293,68 @@ async def test_bart_question(request: Request):
     """
     Test endpoint for asking Bart questions directly
     
-    Body:
+    Accepts two payload formats:
+    
+    1. Simple format:
         {
             "subject": "Test subject",
             "description": "Test description",
-            "conversation": "Additional comments...",  // Optional: additional conversation/comments
-            "ticket_id": 12345,           // Optional: ticket ID to update
-            "tags": ["on_premise"],       // Optional: tags for deployment type detection
-            "add_comment": true,          // Optional: whether to add comment to Zendesk (default: true)
-            "force_reprocess": false      // Optional: bypass deduplication check (default: false)
+            "conversation": "Additional comments...",
+            "ticket_id": 12345,
+            "tags": ["on_premise"],
+            "add_comment": true,
+            "force_reprocess": false
+        }
+    
+    2. Webhook format (extracts from 'detail'):
+        {
+            "detail": {
+                "id": "6254",
+                "subject": "Cannot access my account",
+                "description": "I am unable to log in...",
+                "conversation": "Agent: Hi there...",
+                "tags": ["account_access"],
+                "status": "open"
+            },
+            "add_comment": false,
+            "force_reprocess": false
         }
     """
     try:
         data = await request.json()
-        subject = data.get("subject", "")
-        description = data.get("description", "")
-        conversation = data.get("conversation", "")  # Optional conversation field
-        ticket_id = data.get("ticket_id")
-        tags = data.get("tags", [])
-        add_comment = data.get("add_comment", True)  # Default to True for backward compatibility
-        force_reprocess = data.get("force_reprocess", False)  # Default to False
+        
+        # Check if this is a webhook-style payload with 'detail' field
+        if "detail" in data:
+            logger.info(":inbox_tray: Webhook-style payload detected in test endpoint")
+            detail = data.get("detail", {})
+            
+            # Extract from detail section
+            ticket_id_raw = detail.get("id")
+            ticket_id = int(ticket_id_raw) if ticket_id_raw else None
+            subject = detail.get("subject", "")
+            description = detail.get("description", "")
+            conversation = detail.get("conversation", "")
+            tags = detail.get("tags", [])
+            
+            # Extract parameters from root level
+            add_comment = data.get("add_comment", True)
+            force_reprocess = data.get("force_reprocess", False)
+        else:
+            logger.info(":test_tube: Simple payload format detected in test endpoint")
+            # Simple format - extract from root level
+            subject = data.get("subject", "")
+            description = data.get("description", "")
+            conversation = data.get("conversation", "")
+            ticket_id = data.get("ticket_id")
+            tags = data.get("tags", [])
+            add_comment = data.get("add_comment", True)
+            force_reprocess = data.get("force_reprocess", False)
         
         if not subject and not description:
             raise HTTPException(status_code=400, detail="Missing 'subject' or 'description' field")
+        
+        logger.info(f":test_tube: Test request - Subject: {subject[:80]}")
+        logger.info(f":test_tube: Test request - Ticket ID: {ticket_id}")
         
         mock_ticket = {
             "id": ticket_id or 99999,
