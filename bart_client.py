@@ -1001,6 +1001,65 @@ def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     return jobs.get(job_id)
 
 
+# Watchdog for auto-fixing stuck jobs
+watchdog_running = False
+
+
+async def job_watchdog():
+    """
+    Watchdog that periodically checks for stuck jobs and fixes them
+    Runs every 30 seconds, fixes jobs stuck in 'processing' for >5 minutes
+    """
+    global watchdog_running
+    watchdog_running = True
+    
+    logger.info(":dog: Job watchdog started - checking every 30 seconds for jobs stuck >5 minutes")
+    
+    while watchdog_running:
+        try:
+            await asyncio.sleep(30)  # Check every 30 seconds
+            
+            current_time = time.time()
+            stuck_jobs = []
+            
+            for job_id, job in list(jobs.items()):  # Use list() to avoid dict change during iteration
+                if job.get("status") == "processing":
+                    created_at = job.get("created_at", current_time)
+                    elapsed = current_time - created_at
+                    
+                    # If stuck in processing for >5 minutes, force fix
+                    if elapsed > 300:  # 5 minutes
+                        stuck_jobs.append((job_id, elapsed))
+            
+            if stuck_jobs:
+                logger.warning(f":warning: Watchdog found {len(stuck_jobs)} stuck job(s)")
+                
+                for job_id, elapsed in stuck_jobs:
+                    minutes = int(elapsed / 60)
+                    logger.warning(f":ambulance: Watchdog auto-fixing job {job_id} (stuck for {minutes} minutes)")
+                    
+                    ticket_id = jobs[job_id].get("ticket_id")
+                    
+                    # Force update to error (direct dictionary update)
+                    jobs[job_id]["status"] = "error"
+                    jobs[job_id]["result"] = {
+                        "status": "error",
+                        "error": f"Job was stuck in 'processing' state for {minutes} minutes ({elapsed:.0f} seconds). Auto-fixed by watchdog. Background task likely failed to update status.",
+                        "ticket_id": ticket_id,
+                        "watchdog_fixed": True
+                    }
+                    jobs[job_id]["completed_at"] = current_time
+                    
+                    logger.info(f":white_check_mark: Watchdog fixed job {job_id}")
+        
+        except Exception as e:
+            logger.error(f":x: Watchdog error: {e}")
+            logger.exception("Watchdog exception:")
+            # Continue running despite errors
+    
+    logger.info(":dog: Job watchdog stopped")
+
+
 async def resolve_channel_id(client: AsyncWebClient, channel_name_or_id: str) -> str:
     """Resolve a channel name to its ID"""
     if channel_name_or_id.startswith("C"):
@@ -1118,11 +1177,18 @@ async def startup_event():
     logger.info(f":test_tube:  Test endpoint TTL: {test_processing_ttl:.0f} seconds ({test_processing_ttl/60:.1f} minutes)")
     logger.info(f":speech_balloon:  Bart comment check window: {bart_comment_check_hours} hours")
     logger.info("=" * 80)
+    
+    # Start job watchdog
+    asyncio.create_task(job_watchdog())
+    logger.info(":dog: Job watchdog task created - will auto-fix stuck jobs every 30 seconds")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
+    global watchdog_running
+    watchdog_running = False
+    
     if bart_client:
         await bart_client.disconnect()
     logger.info(":wave: Bart Zendesk Webhook Handler shut down")
@@ -1402,8 +1468,35 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
                     else:
                         logger.error(f":rotating_light: [{job_id}] Job doesn't exist in jobs dictionary!")
                         logger.error(f":rotating_light: [{job_id}] Job may have been deleted during processing")
+            
+            # Wrap with ultra-defensive wrapper
+            async def ultra_safe_wrapper():
+                """Absolutely ensure job gets updated even if task crashes"""
+                task_crashed = False
+                try:
+                    logger.info(f":rocket: [{job_id}] Ultra-safe wrapper: Starting safe_process_with_job()")
+                    await safe_process_with_job()
+                    logger.info(f":white_check_mark: [{job_id}] Ultra-safe wrapper: safe_process_with_job() completed")
+                except Exception as crash_error:
+                    task_crashed = True
+                    logger.error(f":rotating_light: [{job_id}] === WEBHOOK TASK CRASHED ===")
+                    logger.error(f":rotating_light: [{job_id}] Crash error: {crash_error}")
+                    logger.exception("Webhook task crash:")
+                    
+                    # Emergency update
+                    if job_id in jobs and jobs[job_id].get("status") == "processing":
+                        logger.error(f":ambulance: [{job_id}] Emergency update - webhook task crashed")
+                        jobs[job_id]["status"] = "error"
+                        jobs[job_id]["result"] = {
+                            "status": "error",
+                            "error": f"Webhook background task crashed: {str(crash_error)}",
+                            "ticket_id": ticket_id,
+                            "task_crashed": True
+                        }
+                        jobs[job_id]["completed_at"] = time.time()
+                        logger.info(f":white_check_mark: [{job_id}] Emergency update completed")
         
-        background_tasks.add_task(safe_process_with_job)
+        background_tasks.add_task(ultra_safe_wrapper)
         
         # Return immediately with job_id and poll URL
         poll_url = f"/zendesk/job/{job_id}"
@@ -1588,15 +1681,16 @@ async def get_job_status(job_id: str):
     created_at = job.get("created_at")
     elapsed = int(time.time() - created_at)
     
-    # WARNING: If job is stuck in "processing" for >15 minutes, force to error
-    if job_status == "processing" and elapsed > 900:  # 15 minutes
-        logger.warning(f":warning: Job {job_id} stuck in 'processing' for {elapsed}s (>15 min)")
+    # WARNING: If job is stuck in "processing" for >5 minutes, force to error
+    if job_status == "processing" and elapsed > 300:  # 5 minutes
+        logger.warning(f":warning: Job {job_id} stuck in 'processing' for {elapsed}s (>5 min)")
         logger.warning(f":warning: Force-updating to 'error' state")
         
         update_job(job_id, "error", {
             "status": "error",
-            "error": f"Job timed out - stuck in 'processing' state for {elapsed} seconds (>15 minutes). This likely indicates a background task failure.",
-            "ticket_id": ticket_id
+            "error": f"Job timed out - stuck in 'processing' state for {elapsed} seconds (>5 minutes). This likely indicates background task failed to update status.",
+            "ticket_id": ticket_id,
+            "auto_timeout_fix": True
         })
         
         # Re-fetch updated job
@@ -1809,6 +1903,10 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
             
             async def process_with_job_updates():
                 """Process question and update job status"""
+                logger.info(f"")
+                logger.info(f"{'='*80}")
+                logger.info(f":robot_face: [{job_id}] === BACKGROUND TASK STARTED ===")
+                logger.info(f"{'='*80}")
                 logger.info(f":robot_face: [{job_id}] Starting async processing with polling...")
                 logger.info(f":memo: add_comment parameter: {add_comment}")
                 logger.info(f":zap: force_reprocess parameter: {force_reprocess}")
@@ -1826,14 +1924,27 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                         custom_ttl = bart_client.test_processing_ttl
                         logger.info(f":stopwatch: [{job_id}] Using test endpoint TTL: {custom_ttl:.0f} seconds ({custom_ttl/60:.1f} minutes)")
                     
-                    # Ask Bart
+                    # Ask Bart with timeout protection
                     logger.info(f":outbox_tray: [{job_id}] Calling bart_client.ask()...")
-                    result = await bart_client.ask(
-                        question, 
-                        ticket_id=ticket_id or 99999, 
-                        request_id=request_id,
-                        custom_ttl=custom_ttl
-                    )
+                    logger.info(f":alarm_clock: [{job_id}] Timeout limit: 650 seconds (~11 minutes)")
+                    
+                    try:
+                        # Wrap in asyncio timeout (650 seconds = slightly longer than Bart's 600s internal timeout)
+                        result = await asyncio.wait_for(
+                            bart_client.ask(
+                                question, 
+                                ticket_id=ticket_id or 99999, 
+                                request_id=request_id,
+                                custom_ttl=custom_ttl
+                            ),
+                            timeout=650.0  # 650 seconds (~11 minutes)
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(f":alarm_clock: [{job_id}] === ASYNCIO TIMEOUT AFTER 650 SECONDS ===")
+                        logger.error(f":alarm_clock: [{job_id}] bart_client.ask() hung and did not return")
+                        logger.error(f":alarm_clock: [{job_id}] This likely means Bart responded but message detection failed")
+                        raise TimeoutError("bart_client.ask() exceeded 650 second timeout - likely stuck in _wait_for_completion() waiting for messages")
+                    
                     response = result["response"]
                     slack_thread_url = result.get("slack_thread_url", "")
                     elapsed = time.time() - start_time
@@ -1892,6 +2003,24 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                         logger.error(f":x: [{job_id}] Failed to update job to 'skipped': {update_error}")
                         # Don't set job_updated=True, let finally block handle it
                 
+                except (TimeoutError, asyncio.TimeoutError) as e:
+                    # Timeout from asyncio.wait_for or Bart's internal timeout
+                    logger.error(f":alarm_clock: [{job_id}] TIMEOUT: bart_client.ask() exceeded time limit")
+                    logger.error(f":alarm_clock: [{job_id}] Timeout error: {e}")
+                    
+                    try:
+                        update_job(job_id, "error", {
+                            "status": "error",
+                            "error": f"Timeout: bart_client.ask() hung for >12 minutes. Bart may have responded but message detection failed. Original error: {str(e)}",
+                            "ticket_id": ticket_id,
+                            "timeout_error": True
+                        })
+                        job_updated = True
+                        logger.info(f":white_check_mark: [{job_id}] Job status updated to 'error' (timeout)")
+                    except Exception as update_error:
+                        logger.error(f":x: [{job_id}] Failed to update job after timeout: {update_error}")
+                        # Don't set job_updated=True, let finally block handle it
+                
                 except Exception as e:
                     logger.error(f":x: [{job_id}] Error in async processing: {e}")
                     logger.exception("Full traceback:")
@@ -1932,9 +2061,50 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                         else:
                             logger.error(f":rotating_light: [{job_id}] Job doesn't exist in jobs dictionary!")
                             logger.error(f":rotating_light: [{job_id}] Job may have been deleted or never created")
+                    
+                    logger.info(f"")
+                    logger.info(f"{'='*80}")
+                    logger.info(f":checkered_flag: [{job_id}] === BACKGROUND TASK COMPLETED ===")
+                    logger.info(f":mag: [{job_id}] Final job status: {jobs.get(job_id, {}).get('status', 'JOB_NOT_FOUND')}")
+                    logger.info(f"{'='*80}")
+                    logger.info(f"")
             
-            # Start background processing
-            background_tasks.add_task(process_with_job_updates)
+            # Wrap with ultra-defensive wrapper
+            async def ultra_safe_task_wrapper():
+                """Absolutely ensure job status gets updated even if task crashes"""
+                task_crashed = False
+                try:
+                    logger.info(f":rocket: [{job_id}] Ultra-safe wrapper: Starting process_with_job_updates()")
+                    await process_with_job_updates()
+                    logger.info(f":white_check_mark: [{job_id}] Ultra-safe wrapper: process_with_job_updates() completed normally")
+                except Exception as crash_error:
+                    task_crashed = True
+                    logger.error(f":rotating_light: [{job_id}] === BACKGROUND TASK CRASHED ===")
+                    logger.error(f":rotating_light: [{job_id}] Task crash error: {crash_error}")
+                    logger.exception("Background task crash traceback:")
+                    
+                    # Emergency job update
+                    if job_id in jobs and jobs[job_id].get("status") == "processing":
+                        logger.error(f":ambulance: [{job_id}] Emergency update - task crashed, job still 'processing'")
+                        jobs[job_id]["status"] = "error"
+                        jobs[job_id]["result"] = {
+                            "status": "error",
+                            "error": f"Background task crashed with exception: {str(crash_error)}",
+                            "ticket_id": ticket_id,
+                            "task_crashed": True
+                        }
+                        jobs[job_id]["completed_at"] = time.time()
+                        logger.info(f":white_check_mark: [{job_id}] Emergency update completed in crash handler")
+                finally:
+                    if task_crashed:
+                        logger.error(f":x: [{job_id}] Wrapper finally: Task crashed")
+                    else:
+                        logger.info(f":white_check_mark: [{job_id}] Wrapper finally: Task completed normally")
+            
+            # Start background processing with wrapper
+            logger.info(f":rocket: [{job_id}] Adding ultra_safe_task_wrapper to background_tasks...")
+            background_tasks.add_task(ultra_safe_task_wrapper)
+            logger.info(f":white_check_mark: [{job_id}] Background task added successfully")
             
             # Return immediately (202 Accepted) with polling URL
             poll_url = f"/zendesk/job/{job_id}"
