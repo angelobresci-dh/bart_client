@@ -612,15 +612,20 @@ class ZendeskWebhookHandler:
         return "cloud"
     
     def build_question_from_ticket(self, ticket: Dict[str, Any], zendesk_subdomain: str) -> str:
-        """Build a complete question from ticket Subject and Description with prompt engineering"""
+        """Build a complete question from ticket Subject, Description, and Conversation with prompt engineering"""
         ticket_id = ticket.get("id", "unknown")
         subject = ticket.get("subject", "").strip()
         description = ticket.get("description", "").strip()
+        conversation = ticket.get("conversation", "").strip()  # Additional comments after initial creation
         tags = ticket.get("tags", [])
         organization_id = ticket.get("organization_id")
         
         logger.info(f":label: Extracted {len(tags)} tags from ticket: {tags[:5]}{'...' if len(tags) > 5 else ''}")
         logger.info(f":building_construction: Organization ID: {organization_id}")
+        
+        # Log conversation field presence
+        if conversation:
+            logger.info(f":speech_balloon: Conversation field present: {len(conversation)} characters")
         
         # Fetch organization name if available
         organization_name = None
@@ -640,12 +645,16 @@ class ZendeskWebhookHandler:
         # Build ticket URL
         ticket_url = f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
         
-        # Build the question with Subject and Description
+        # Build the question with Subject, Description, and Conversation
         question_parts = []
         if subject:
             question_parts.append(f"Subject: {subject}")
         if description:
             question_parts.append(f"*Description:*\n{description}")
+        
+        # Add conversation/additional comments if present
+        if conversation:
+            question_parts.append(f"*Additional Comments / Conversation:*\n{conversation}")
         
         # Add company/customer name if available
         if organization_name:
@@ -1020,11 +1029,12 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
     
     Accepts webhook payloads from Zendesk and processes tickets with Bart.
     
-    Request body can include optional 'add_comment' field:
+    Request body can include optional fields:
     {
         "type": "zen:event-type:ticket.created",
         "detail": { ... ticket data ... },
-        "add_comment": false  // Optional: default is true
+        "add_comment": false,      // Optional: whether to add comment to Zendesk (default: true)
+        "force_reprocess": true    // Optional: bypass deduplication check (default: false)
     }
     """
     body = await request.body()
@@ -1042,6 +1052,9 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
     
     # Extract add_comment parameter from request body (default: True)
     add_comment = payload.get("add_comment", True)
+    
+    # Extract force_reprocess parameter from request body (default: False)
+    force_reprocess = payload.get("force_reprocess", False)
     
     # Log the raw payload structure for debugging
     logger.info(f":mag: Raw webhook payload keys: {list(payload.keys())}")
@@ -1085,9 +1098,10 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
     logger.info(f":mailbox_with_mail: Subject: {ticket_subject[:80]}")
     logger.info(f":mailbox_with_mail: Trigger: Zendesk webhook")
     logger.info(f":memo: add_comment parameter: {add_comment}")
+    logger.info(f":zap: force_reprocess parameter: {force_reprocess}")
     
-    # Check if ticket was recently processed
-    if bart_client.was_recently_processed(ticket_id):
+    # Check if ticket was recently processed (unless force_reprocess is True)
+    if not force_reprocess and bart_client.was_recently_processed(ticket_id):
         time_since = time.time() - bart_client.processed_tickets[ticket_id]
         minutes_ago = int(time_since / 60)
         logger.warning(f":warning: DUPLICATE WEBHOOK - Ticket #{ticket_id} was already processed {minutes_ago} minute(s) ago")
@@ -1097,9 +1111,13 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
             content={
                 "status": "rejected",
                 "reason": f"Ticket already processed {minutes_ago} minute(s) ago",
-                "ticket_id": ticket_id
+                "ticket_id": ticket_id,
+                "message": "Use force_reprocess=true in request body to override deduplication"
             }
         )
+    
+    if force_reprocess:
+        logger.info(f":zap: force_reprocess=true - Bypassing deduplication check")
     
     logger.info(f":white_check_mark: Webhook accepted, queuing for processing")
     
@@ -1109,6 +1127,11 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
         logger.info(f":mag: Fetching current ticket data from Zendesk for ticket #{ticket_id}")
         fresh_ticket = zendesk_client.get_ticket(ticket_id)
         
+        # Extract conversation field from webhook payload if available
+        # The Zendesk API Ticket object may not include the full conversation field
+        # so we use the webhook payload's conversation field if present
+        conversation = ticket_detail.get("conversation", "")
+        
         # Use fresh data from Zendesk, not webhook payload
         normalized_payload = {
             "event_type": event_type,
@@ -1117,11 +1140,14 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
                 "status": fresh_ticket.status,
                 "subject": fresh_ticket.subject,
                 "description": fresh_ticket.description,
+                "conversation": conversation,  # Use conversation from webhook payload
                 "tags": fresh_ticket.tags,
                 "organization_id": fresh_ticket.organization_id
             }
         }
         logger.info(f":white_check_mark: Fetched fresh ticket data - Current status: {fresh_ticket.status}")
+        if conversation:
+            logger.info(f":speech_balloon: Conversation field included: {len(conversation)} characters")
     except Exception as e:
         logger.error(f":x: Failed to fetch fresh ticket data from Zendesk: {e}")
         logger.warning(f":warning: Falling back to webhook payload data")
@@ -1136,6 +1162,9 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
                 logger.warning(f":warning: Invalid organization_id format: {org_id_raw}, setting to None")
                 org_id = None
         
+        # Extract conversation field from webhook payload
+        conversation = ticket_detail.get("conversation", "")
+        
         normalized_payload = {
             "event_type": event_type,
             "ticket": {
@@ -1143,10 +1172,14 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
                 "status": ticket_detail.get("status"),
                 "subject": ticket_detail.get("subject"),
                 "description": ticket_detail.get("description"),
+                "conversation": conversation,
                 "tags": ticket_detail.get("tags", []),
                 "organization_id": org_id
             }
         }
+        
+        if conversation:
+            logger.info(f":speech_balloon: Conversation field included (fallback): {len(conversation)} characters")
     
     # Wrapper to catch background task errors
     async def safe_process_ticket():
@@ -1165,23 +1198,27 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
             "status": "accepted",
             "ticket_id": ticket_id,
             "add_comment": add_comment,
+            "force_reprocess": force_reprocess,
             "message": f"Ticket #{ticket_id} queued for processing" + ("" if add_comment else " (comment will NOT be added to Zendesk)")
         }
     )
 
 
 @app.get("/zendesk/ticket/{ticket_id}")
-async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks, add_comment: bool = True):
+async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks, add_comment: bool = True, force_reprocess: bool = False):
     """
     GET endpoint to process a Zendesk ticket by ID
     
     Args:
         ticket_id: Zendesk ticket ID
         add_comment: If True, add Bart's response to Zendesk ticket. If False, only return in response (default: True)
+        force_reprocess: If True, bypass deduplication check and reprocess even if recently processed (default: False)
     
     Example:
-        GET /zendesk/ticket/12345              # Adds comment (default)
-        GET /zendesk/ticket/12345?add_comment=false  # Only returns response, no comment
+        GET /zendesk/ticket/12345                                  # Normal processing
+        GET /zendesk/ticket/12345?add_comment=false                # No comment
+        GET /zendesk/ticket/12345?force_reprocess=true             # Force reprocess
+        GET /zendesk/ticket/12345?add_comment=false&force_reprocess=true  # Both options
     """
     try:
         logger.info(f":inbox_tray: ===== GET REQUEST RECEIVED =====")
@@ -1189,8 +1226,8 @@ async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks, 
         logger.info(f":inbox_tray: Trigger: HTTP GET request")
         logger.info(f":inbox_tray: Fetching Zendesk ticket #{ticket_id}")
         
-        # Check if ticket was recently processed
-        if bart_client.was_recently_processed(ticket_id):
+        # Check if ticket was recently processed (unless force_reprocess is True)
+        if not force_reprocess and bart_client.was_recently_processed(ticket_id):
             time_since = time.time() - bart_client.processed_tickets[ticket_id]
             minutes_ago = int(time_since / 60)
             logger.warning(f":warning: DUPLICATE REQUEST - Ticket #{ticket_id} was already processed {minutes_ago} minute(s) ago")
@@ -1200,18 +1237,24 @@ async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks, 
                     "status": "skipped",
                     "reason": f"Ticket already processed {minutes_ago} minute(s) ago",
                     "ticket_id": ticket_id,
-                    "message": f"Ticket #{ticket_id} was recently processed. Wait {60 - minutes_ago} more minute(s) or restart app to reprocess."
+                    "message": f"Ticket #{ticket_id} was recently processed. Wait {60 - minutes_ago} more minute(s) or use force_reprocess=true to override."
                 }
             )
         
+        if force_reprocess:
+            logger.info(f":zap: force_reprocess=true - Bypassing deduplication check")
+        
         ticket = zendesk_client.get_ticket(ticket_id)
         
+        # Note: Conversation field is not available when fetching via API
+        # It's only included in Zendesk webhook payloads
         payload = {
             "event_type": "ticket.get",
             "ticket": {
                 "id": ticket.id,
                 "subject": ticket.subject,
                 "description": ticket.description,
+                "conversation": "",  # Not available via direct API fetch
                 "tags": ticket.tags,
                 "status": ticket.status,
                 "organization_id": ticket.organization_id
@@ -1220,6 +1263,7 @@ async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks, 
         
         logger.info(f":white_check_mark: Fetched ticket #{ticket_id}: {ticket.subject}")
         logger.info(f":memo: add_comment parameter: {add_comment}")
+        logger.info(f":zap: force_reprocess parameter: {force_reprocess}")
         logger.info(f":white_check_mark: GET request accepted, queuing for processing")
         
         background_tasks.add_task(
@@ -1235,6 +1279,7 @@ async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks, 
                 "status": "accepted",
                 "ticket_id": ticket_id,
                 "add_comment": add_comment,
+                "force_reprocess": force_reprocess,
                 "message": f"Ticket #{ticket_id} queued for processing with Bart" + ("" if add_comment else " (comment will NOT be added to Zendesk)")
             }
         )
@@ -1252,18 +1297,22 @@ async def test_bart_question(request: Request):
         {
             "subject": "Test subject",
             "description": "Test description",
+            "conversation": "Additional comments...",  // Optional: additional conversation/comments
             "ticket_id": 12345,           // Optional: ticket ID to update
             "tags": ["on_premise"],       // Optional: tags for deployment type detection
-            "add_comment": true           // Optional: whether to add comment to Zendesk (default: true)
+            "add_comment": true,          // Optional: whether to add comment to Zendesk (default: true)
+            "force_reprocess": false      // Optional: bypass deduplication check (default: false)
         }
     """
     try:
         data = await request.json()
         subject = data.get("subject", "")
         description = data.get("description", "")
+        conversation = data.get("conversation", "")  # Optional conversation field
         ticket_id = data.get("ticket_id")
         tags = data.get("tags", [])
         add_comment = data.get("add_comment", True)  # Default to True for backward compatibility
+        force_reprocess = data.get("force_reprocess", False)  # Default to False
         
         if not subject and not description:
             raise HTTPException(status_code=400, detail="Missing 'subject' or 'description' field")
@@ -1272,6 +1321,7 @@ async def test_bart_question(request: Request):
             "id": ticket_id or 99999,
             "subject": subject,
             "description": description,
+            "conversation": conversation,
             "tags": tags,
             "status": "open",
             "organization_id": None
@@ -1279,6 +1329,8 @@ async def test_bart_question(request: Request):
         
         question = webhook_handler.build_question_from_ticket(mock_ticket, zendesk_subdomain)
         logger.info(f":test_tube: Test question:\n{question}")
+        logger.info(f":memo: add_comment parameter: {add_comment}")
+        logger.info(f":zap: force_reprocess parameter: {force_reprocess}")
         
         request_id = str(uuid.uuid4())[:8]
         start_time = time.time()
@@ -1312,6 +1364,7 @@ async def test_bart_question(request: Request):
             "deployment_type": webhook_handler.detect_deployment_type(tags),
             "ticket_updated": ticket_id is not None and add_comment,
             "comment_added": add_comment if ticket_id else False,
+            "force_reprocess": force_reprocess,
             "processing_time_seconds": elapsed,
             "slack_thread_url": slack_thread_url
         }
