@@ -21,6 +21,7 @@ Environment Variables:
     BART_COMPLETION_WAIT - Optional: Seconds to wait after last message with final response (default: 120, i.e., 2 minutes)
     BART_FALLBACK_WAIT - Optional: Seconds to wait if no final message detected (default: 540, i.e., 9 minutes)
     PROCESSING_HISTORY_TTL - Optional: Seconds to keep processing history for deduplication (default: 3600, i.e., 1 hour)
+    TEST_PROCESSING_TTL - Optional: Shorter TTL for test endpoint deduplication (default: 300, i.e., 5 minutes)
     BART_COMMENT_CHECK_HOURS - Optional: Hours to check for existing Bart comments before reprocessing (default: 24 hours)
 """
 import asyncio
@@ -66,7 +67,8 @@ class BartClient:
         self.pending_responses = {}
         self.active_tickets = set()  # Track tickets currently being processed
         self.processed_tickets = {}  # Track recently processed tickets: {ticket_id: timestamp}
-        self.processing_history_ttl = 3600  # Keep history for 1 hour
+        self.processing_history_ttl = 3600  # Keep history for 1 hour (default)
+        self.test_processing_ttl = 300  # Shorter TTL for test endpoint (default: 5 minutes)
         
         # Register UNIFIED message handler that handles both new messages AND edits
         self.app.event("message")(self._handle_message)
@@ -81,10 +83,29 @@ class BartClient:
         for ticket_id in expired_tickets:
             self.processed_tickets.pop(ticket_id, None)
     
-    def was_recently_processed(self, ticket_id: int) -> bool:
-        """Check if ticket was processed recently (within TTL window)"""
+    def was_recently_processed(self, ticket_id: int, custom_ttl: Optional[float] = None) -> bool:
+        """
+        Check if ticket was processed recently (within TTL window)
+        
+        Args:
+            ticket_id: Ticket ID to check
+            custom_ttl: Optional custom TTL in seconds (uses default processing_history_ttl if not provided)
+                       If set to 0, always returns False (bypasses deduplication entirely)
+        """
         self._cleanup_processing_history()
-        return ticket_id in self.processed_tickets
+        
+        # If custom_ttl is 0, bypass deduplication entirely (force_reprocess behavior)
+        if custom_ttl == 0:
+            return False
+        
+        if ticket_id not in self.processed_tickets:
+            return False
+        
+        # Use custom TTL if provided, otherwise use default
+        ttl = custom_ttl if custom_ttl is not None else self.processing_history_ttl
+        time_since = time.time() - self.processed_tickets[ticket_id]
+        
+        return time_since < ttl
     
     def mark_as_processed(self, ticket_id: int):
         """Mark ticket as processed with current timestamp"""
@@ -422,7 +443,7 @@ class BartClient:
                 logger.error(f":x: [{request_id}] Failed to upload file or get timestamp: {e}")
                 raise
     
-    async def ask(self, question: str, ticket_id: int, request_id: str, timeout: Optional[float] = None) -> Dict[str, Any]:
+    async def ask(self, question: str, ticket_id: int, request_id: str, timeout: Optional[float] = None, custom_ttl: Optional[float] = None) -> Dict[str, Any]:
         """
         Ask Bart a question by posting to channel with @mention.
         
@@ -431,6 +452,7 @@ class BartClient:
             ticket_id: Zendesk ticket ID (to prevent race conditions)
             request_id: Unique request ID for logging
             timeout: Optional timeout in seconds
+            custom_ttl: Optional custom TTL for deduplication check (uses default if not provided)
         
         Returns:
             dict: {
@@ -440,12 +462,15 @@ class BartClient:
             }
         """
         # Check if this ticket was recently processed (deduplication)
-        if self.was_recently_processed(ticket_id):
+        # Use custom TTL if provided
+        if self.was_recently_processed(ticket_id, custom_ttl=custom_ttl):
             time_since = time.time() - self.processed_tickets[ticket_id]
             minutes_ago = int(time_since / 60)
+            ttl_used = custom_ttl if custom_ttl is not None else self.processing_history_ttl
+            ttl_minutes = int(ttl_used / 60)
             raise ValueError(
                 f"Ticket {ticket_id} was already processed {minutes_ago} minute(s) ago. "
-                f"Skipping to prevent duplicate processing."
+                f"Skipping to prevent duplicate processing (TTL: {ttl_minutes} minutes)."
             )
         
         # Check if this ticket is already being processed
@@ -707,7 +732,7 @@ Instructions for your response:
         
         return True
     
-    async def process_ticket_event(self, payload: Dict[str, Any], zendesk_subdomain: str, add_comment: bool = True) -> Dict[str, Any]:
+    async def process_ticket_event(self, payload: Dict[str, Any], zendesk_subdomain: str, add_comment: bool = True, is_test_request: bool = False) -> Dict[str, Any]:
         """
         Process a Zendesk ticket create/update event
         
@@ -716,6 +741,7 @@ Instructions for your response:
             zendesk_subdomain: Zendesk subdomain for building URLs
             add_comment: If True, add Bart's response as a comment to the Zendesk ticket.
                         If False, only return the response in the result dict (default: True)
+            is_test_request: If True, use shorter TTL for deduplication (default: False)
         """
         # Generate unique request ID for tracking
         request_id = str(uuid.uuid4())[:8]
@@ -730,9 +756,15 @@ Instructions for your response:
         logger.info(f":inbox_tray: [{request_id}] Event Type: {event_type}")
         logger.info(f":inbox_tray: [{request_id}] Ticket Status: {ticket.get('status', 'unknown')}")
         logger.info(f":inbox_tray: [{request_id}] Subject: {ticket.get('subject', 'N/A')[:80]}")
+        logger.info(f":test_tube: [{request_id}] Is test request: {is_test_request}")
+        
+        # Determine TTL to use based on request type
+        ttl_to_use = self.bart.test_processing_ttl if is_test_request else None
+        if ttl_to_use:
+            logger.info(f":stopwatch: [{request_id}] Using test endpoint TTL: {ttl_to_use:.0f} seconds ({ttl_to_use/60:.1f} minutes)")
         
         # Log processing history status
-        if self.bart.was_recently_processed(ticket_id):
+        if self.bart.was_recently_processed(ticket_id, custom_ttl=ttl_to_use):
             time_since = time.time() - self.bart.processed_tickets[ticket_id]
             minutes_ago = int(time_since / 60)
             logger.info(f":clock1: [{request_id}] Processing history: Last processed {minutes_ago} minute(s) ago")
@@ -770,7 +802,13 @@ Instructions for your response:
             logger.info(f":robot_face: [{request_id}] Asking Bart about ticket #{ticket_id}...")
             start_time = time.time()
             
-            result = await self.bart.ask(question, ticket_id=ticket_id, request_id=request_id)
+            # Pass custom TTL for test requests
+            result = await self.bart.ask(
+                question, 
+                ticket_id=ticket_id, 
+                request_id=request_id,
+                custom_ttl=ttl_to_use
+            )
             bart_response = result["response"]
             response_ticket_id = result["ticket_id"]
             slack_thread_url = result.get("slack_thread_url", "")
@@ -930,6 +968,7 @@ async def startup_event():
     bart_completion_wait = float(os.getenv("BART_COMPLETION_WAIT", "120"))
     bart_fallback_wait = float(os.getenv("BART_FALLBACK_WAIT", "540"))
     processing_history_ttl = float(os.getenv("PROCESSING_HISTORY_TTL", "3600"))  # 1 hour default
+    test_processing_ttl = float(os.getenv("TEST_PROCESSING_TTL", "300"))  # 5 minutes default for test endpoint
     bart_comment_check_hours = int(os.getenv("BART_COMMENT_CHECK_HOURS", "24"))  # 24 hours default
     
     if not all([bot_token, app_token, zendesk_subdomain, zendesk_email, zendesk_token]):
@@ -959,8 +998,10 @@ async def startup_event():
         fallback_wait=bart_fallback_wait
     )
     
-    # Set custom processing history TTL if specified
+    # Set custom processing history TTLs if specified
     bart_client.processing_history_ttl = processing_history_ttl
+    bart_client.test_processing_ttl = test_processing_ttl
+    
     zendesk_client = ZendeskClient(
         subdomain=zendesk_subdomain,
         email=zendesk_email,
@@ -1000,6 +1041,7 @@ async def startup_event():
     logger.info(f":stopwatch:  Bart completion wait: {bart_completion_wait:.0f} seconds ({bart_completion_wait/60:.1f} minutes)")
     logger.info(f":stopwatch:  Bart fallback wait: {bart_fallback_wait:.0f} seconds ({bart_fallback_wait/60:.1f} minutes)")
     logger.info(f":shield:  Processing history TTL: {processing_history_ttl:.0f} seconds ({processing_history_ttl/60:.1f} minutes)")
+    logger.info(f":test_tube:  Test endpoint TTL: {test_processing_ttl:.0f} seconds ({test_processing_ttl/60:.1f} minutes)")
     logger.info(f":speech_balloon:  Bart comment check window: {bart_comment_check_hours} hours")
     logger.info("=" * 80)
 
@@ -1374,7 +1416,22 @@ async def test_bart_question(request: Request):
         request_id = str(uuid.uuid4())[:8]
         start_time = time.time()
         
-        result = await bart_client.ask(question, ticket_id=ticket_id or 99999, request_id=request_id)
+        # Use shorter TTL for test endpoint unless force_reprocess bypasses it entirely
+        # force_reprocess=True means "skip deduplication completely" (custom_ttl=0)
+        # force_reprocess=False means "use test endpoint TTL" (custom_ttl=300 seconds default)
+        if force_reprocess:
+            custom_ttl = 0  # Bypass deduplication entirely
+            logger.info(f":zap: force_reprocess=true - Bypassing deduplication (TTL=0)")
+        else:
+            custom_ttl = bart_client.test_processing_ttl
+            logger.info(f":stopwatch: Using test endpoint TTL: {custom_ttl:.0f} seconds ({custom_ttl/60:.1f} minutes)")
+        
+        result = await bart_client.ask(
+            question, 
+            ticket_id=ticket_id or 99999, 
+            request_id=request_id,
+            custom_ttl=custom_ttl
+        )
         response = result["response"]
         slack_thread_url = result.get("slack_thread_url", "")
         elapsed = time.time() - start_time
