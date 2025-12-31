@@ -237,6 +237,11 @@ class BartClient:
         """
         log = logger
         
+        # Log EVERY message event for debugging
+        log.info(f":email: SLACK MESSAGE EVENT RECEIVED")
+        log.info(f"   Event keys: {list(event.keys())}")
+        log.info(f"   Subtype: {event.get('subtype', 'None')}")
+        
         # Check if this is an edit or a new message
         subtype = event.get("subtype")
         if subtype == "message_changed":
@@ -257,15 +262,23 @@ class BartClient:
             is_edit = False
             event_type_label = "NEW"
         
-        # Debug logging for file upload threads
-        if user_id == self.BART_USER_ID:
-            log.info(f":speech_balloon: [{event_type_label}] Message from Bart: user={user_id}, thread_ts={thread_ts}, ts={ts}")
-            log.info(f"   Currently tracking threads: {list(self.pending_responses.keys())}")
+        # Log message details for ALL messages (not just Bart's)
+        log.info(f":email: [{event_type_label}] user_id={user_id}, thread_ts={thread_ts}, ts={ts}")
+        log.info(f"   Text preview: {text[:80] if text else '(empty)'}...")
+        log.info(f"   Currently tracking threads: {list(self.pending_responses.keys())}")
+        
+        # Check if this is from Bart
+        is_from_bart = (user_id == self.BART_USER_ID)
+        log.info(f"   Is from Bart? {is_from_bart} (Bart user_id: {self.BART_USER_ID})")
+        
+        # Check if thread is being tracked
+        is_tracked_thread = thread_ts in self.pending_responses if thread_ts else False
+        log.info(f"   Is tracked thread? {is_tracked_thread}")
         
         # Only process messages FROM Bart in threads we're tracking
         if user_id == self.BART_USER_ID and thread_ts and thread_ts in self.pending_responses:
             request_id = self.pending_responses[thread_ts].get("request_id", "unknown")
-            log.info(f":incoming_envelope: [{request_id}] Bart message {event_type_label} in thread {thread_ts}")
+            log.info(f":white_check_mark: [{request_id}] ✅ MATCHED - Processing Bart message {event_type_label} in thread {thread_ts}")
             log.info(f"   Text preview: {text[:100]}...")
             
             # Classify message
@@ -321,9 +334,22 @@ class BartClient:
         """Wait for Bart to finish responding"""
         request_id = self.pending_responses[thread_ts].get("request_id", "unknown")
         start_time = time.time()
+        last_heartbeat = time.time()
+        
+        logger.info(f":hourglass: [{request_id}] Starting wait_for_completion loop...")
+        logger.info(f":hourglass: [{request_id}] Waiting for Bart to reply to thread {thread_ts}")
+        logger.info(f":hourglass: [{request_id}] Timeout: {timeout} seconds")
         
         while True:
             elapsed = time.time() - start_time
+            
+            # Heartbeat logging every 30 seconds
+            if time.time() - last_heartbeat > 30:
+                logger.info(f":heartbeat: [{request_id}] Still waiting... ({elapsed:.0f}s elapsed)")
+                logger.info(f":heartbeat: [{request_id}] Messages received so far: {len(self.pending_responses[thread_ts]['messages'])}")
+                logger.info(f":heartbeat: [{request_id}] WebSocket connected: {self.handler is not None}")
+                last_heartbeat = time.time()
+            
             if elapsed > timeout:
                 logger.warning(f":alarm_clock: [{request_id}] Timeout reached after {elapsed:.1f} seconds")
                 raise TimeoutError(f"Bart didn't finish responding within {timeout} seconds")
@@ -353,6 +379,7 @@ class BartClient:
             # Fallback: If no final message detected but we've been waiting a long time
             if time_since_last > self.fallback_wait:
                 logger.warning(f":warning: [{request_id}] No new messages for {time_since_last:.1f}s but no final message detected")
+                logger.warning(f":warning: [{request_id}] Giving up and returning what we have")
                 return
             
             await asyncio.sleep(2)
@@ -397,7 +424,7 @@ class BartClient:
         
         # Slack message limit is 40,000 chars, but we'll be conservative
         # If message is too long, use file attachment instead
-        MAX_MESSAGE_LENGTH = 3000  # Conservative limit to prevent splitting
+        MAX_MESSAGE_LENGTH = 35000  # Much higher to avoid file uploads (was 3000)
         
         if len(formatted_question) <= MAX_MESSAGE_LENGTH:
             # Short enough - post as regular message
@@ -524,6 +551,13 @@ class BartClient:
                 "ticket_id": ticket_id,
                 "request_id": request_id
             }
+            
+            logger.info(f":eyes: [{request_id}] ===== TRACKING SETUP =====")
+            logger.info(f":eyes: [{request_id}] Now tracking thread_ts: {message_ts}")
+            logger.info(f":eyes: [{request_id}] All tracked threads: {list(self.pending_responses.keys())}")
+            logger.info(f":eyes: [{request_id}] WebSocket handler active: {self.handler is not None}")
+            logger.info(f":eyes: [{request_id}] Waiting for Bart to reply to thread {message_ts}...")
+            logger.info(f":eyes: [{request_id}] =============================")
             
             try:
                 # Wait for Bart to finish responding
