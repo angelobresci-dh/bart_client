@@ -139,43 +139,36 @@ class BartClient:
         # Explicit final message indicators (these are NOT working messages)
         final_indicators = [
             "All repos already up-to-date",
-            ":white_check_mark: All repos already up-to-date",
-            "Got it!",  # Bart's typical response starter
-            "Based on",  # Bart providing analysis
-            "Here's what",  # Bart explaining
-            "The issue",  # Bart diagnosing
-            "Response:",  # Explicit response section
+            ":white_check_mark: All repos already up-to-date"
         ]
         
         for indicator in final_indicators:
             if indicator in text:
                 return False  # This is a final message, not a working message
         
-        # Very short messages are working messages
-        if not text or len(text.strip()) < 50:
+        if not text or len(text.strip()) < 80:
             return True
         
-        # CRITICAL: If message is long (>300 chars), it's DEFINITELY substantive content
-        # Even if it contains "Let me" or "Looking" - those are just conversational
-        if len(text.strip()) >= 300:
+        # IMPORTANT: If message is long (200+ chars), it's substantive content
+        # even if it contains words like "Looking" or "Analyzing"
+        if len(text.strip()) >= 200:
             return False
         
-        # Medium length (50-300 chars) - check for working indicators
         working_indicators = [
             r":mag:",
             r":mag_right:",
             r"\bSearching\b",
+            r"\bLooking\b",
             r"\bAnalyzing\b",
+            r"\bLet me\b",
             r"\bChecking\b",
             r"\bFinding\b",
             r"\bExploring\b",
             r"Ay caramba",
             r"Don't have a cow",
-            r"checking the code",
-            r"^Let me\s+(search|check|find|look)",  # Only "Let me search/check/find" at start
+            r"checking the code"
         ]
         
-        # Only check patterns for medium-length messages
         for pattern in working_indicators:
             if re.search(pattern, text, re.IGNORECASE):
                 return True
@@ -192,39 +185,28 @@ class BartClient:
         """
         Detect if this looks like a final, complete message from Bart.
         Returns True if message appears to be a complete response.
-        VERY LENIENT - better to capture too early than wait forever.
+        Less strict criteria - just needs to be substantial and not a working message.
         """
         # Explicit final message indicators
         final_indicators = [
             "All repos already up-to-date",
-            ":white_check_mark: All repos already up-to-date",
-            "Got it!",
-            "Response:",
-            "Here's what's happening",
-            "Based on",
+            ":white_check_mark: All repos already up-to-date"
         ]
         
         for indicator in final_indicators:
             if indicator in text:
                 return True  # Definitely a final message
         
-        # Very short messages are not final
-        if not text or len(text) < 50:
+        if not text or len(text) < 50:  # Reduced threshold
             return False
         
-        # If it's a working message, it's not final
         if self.is_working_message(text):
             return False
         
-        # CRITICAL: Any message >500 chars is DEFINITELY final
-        # Don't wait for more - this is substantive content
-        if len(text.strip()) >= 500:
-            return True
-        
-        # Medium messages (50-500 chars) - check for completion indicators
+        # More lenient - any substantial message that's not a working message
+        # could be a final message (Bart may send multiple final messages)
         has_substance = len(text) > 50
         not_trailing_dots = not text.strip().endswith("...")
-        has_formatting = any(marker in text for marker in ["**", "```", "*", "- ", "1.", "2.", "###"])
         
         return has_substance and not_trailing_dots
     
@@ -236,11 +218,6 @@ class BartClient:
         - Message edits (subtype == "message_changed")
         """
         log = logger
-        
-        # Log EVERY message event for debugging
-        log.info(f":email: SLACK MESSAGE EVENT RECEIVED")
-        log.info(f"   Event keys: {list(event.keys())}")
-        log.info(f"   Subtype: {event.get('subtype', 'None')}")
         
         # Check if this is an edit or a new message
         subtype = event.get("subtype")
@@ -262,23 +239,15 @@ class BartClient:
             is_edit = False
             event_type_label = "NEW"
         
-        # Log message details for ALL messages (not just Bart's)
-        log.info(f":email: [{event_type_label}] user_id={user_id}, thread_ts={thread_ts}, ts={ts}")
-        log.info(f"   Text preview: {text[:80] if text else '(empty)'}...")
-        log.info(f"   Currently tracking threads: {list(self.pending_responses.keys())}")
-        
-        # Check if this is from Bart
-        is_from_bart = (user_id == self.BART_USER_ID)
-        log.info(f"   Is from Bart? {is_from_bart} (Bart user_id: {self.BART_USER_ID})")
-        
-        # Check if thread is being tracked
-        is_tracked_thread = thread_ts in self.pending_responses if thread_ts else False
-        log.info(f"   Is tracked thread? {is_tracked_thread}")
+        # Debug logging for file upload threads
+        if user_id == self.BART_USER_ID:
+            log.info(f":speech_balloon: [{event_type_label}] Message from Bart: user={user_id}, thread_ts={thread_ts}, ts={ts}")
+            log.info(f"   Currently tracking threads: {list(self.pending_responses.keys())}")
         
         # Only process messages FROM Bart in threads we're tracking
         if user_id == self.BART_USER_ID and thread_ts and thread_ts in self.pending_responses:
             request_id = self.pending_responses[thread_ts].get("request_id", "unknown")
-            log.info(f":white_check_mark: [{request_id}] ✅ MATCHED - Processing Bart message {event_type_label} in thread {thread_ts}")
+            log.info(f":incoming_envelope: [{request_id}] Bart message {event_type_label} in thread {thread_ts}")
             log.info(f"   Text preview: {text[:100]}...")
             
             # Classify message
@@ -334,22 +303,9 @@ class BartClient:
         """Wait for Bart to finish responding"""
         request_id = self.pending_responses[thread_ts].get("request_id", "unknown")
         start_time = time.time()
-        last_heartbeat = time.time()
-        
-        logger.info(f":hourglass: [{request_id}] Starting wait_for_completion loop...")
-        logger.info(f":hourglass: [{request_id}] Waiting for Bart to reply to thread {thread_ts}")
-        logger.info(f":hourglass: [{request_id}] Timeout: {timeout} seconds")
         
         while True:
             elapsed = time.time() - start_time
-            
-            # Heartbeat logging every 30 seconds
-            if time.time() - last_heartbeat > 30:
-                logger.info(f":heartbeat: [{request_id}] Still waiting... ({elapsed:.0f}s elapsed)")
-                logger.info(f":heartbeat: [{request_id}] Messages received so far: {len(self.pending_responses[thread_ts]['messages'])}")
-                logger.info(f":heartbeat: [{request_id}] WebSocket connected: {self.handler is not None}")
-                last_heartbeat = time.time()
-            
             if elapsed > timeout:
                 logger.warning(f":alarm_clock: [{request_id}] Timeout reached after {elapsed:.1f} seconds")
                 raise TimeoutError(f"Bart didn't finish responding within {timeout} seconds")
@@ -363,23 +319,12 @@ class BartClient:
             time_since_last = time.time() - last_message_time
             has_final = any(msg["is_final"] for msg in messages)
             
-            # NEW: If we have a VERY long message (>1000 chars), consider it immediately final
-            # Don't wait for completion_wait - it's clearly substantive content
-            very_long_messages = [msg for msg in messages if len(msg["text"]) > 1000]
-            if very_long_messages and time_since_last > 10:  # Just 10 seconds after long message
-                logger.info(f":zap: [{request_id}] Detected very long message ({len(very_long_messages[0]['text'])} chars)")
-                logger.info(f":zap: [{request_id}] Early exit - not waiting full completion_wait")
-                return
-            
-            # If we have a final message and no new messages for completion_wait seconds
             if has_final and time_since_last > self.completion_wait:
                 logger.info(f":white_check_mark: [{request_id}] Bart appears to be done (no messages for {time_since_last:.1f}s, have final message)")
                 return
             
-            # Fallback: If no final message detected but we've been waiting a long time
             if time_since_last > self.fallback_wait:
                 logger.warning(f":warning: [{request_id}] No new messages for {time_since_last:.1f}s but no final message detected")
-                logger.warning(f":warning: [{request_id}] Giving up and returning what we have")
                 return
             
             await asyncio.sleep(2)
@@ -424,7 +369,7 @@ class BartClient:
         
         # Slack message limit is 40,000 chars, but we'll be conservative
         # If message is too long, use file attachment instead
-        MAX_MESSAGE_LENGTH = 35000  # Much higher to avoid file uploads (was 3000)
+        MAX_MESSAGE_LENGTH = 3000  # Conservative limit to prevent splitting
         
         if len(formatted_question) <= MAX_MESSAGE_LENGTH:
             # Short enough - post as regular message
@@ -551,13 +496,6 @@ class BartClient:
                 "ticket_id": ticket_id,
                 "request_id": request_id
             }
-            
-            logger.info(f":eyes: [{request_id}] ===== TRACKING SETUP =====")
-            logger.info(f":eyes: [{request_id}] Now tracking thread_ts: {message_ts}")
-            logger.info(f":eyes: [{request_id}] All tracked threads: {list(self.pending_responses.keys())}")
-            logger.info(f":eyes: [{request_id}] WebSocket handler active: {self.handler is not None}")
-            logger.info(f":eyes: [{request_id}] Waiting for Bart to reply to thread {message_ts}...")
-            logger.info(f":eyes: [{request_id}] =============================")
             
             try:
                 # Wait for Bart to finish responding
@@ -1026,100 +964,21 @@ def create_job(ticket_id: int, payload: Dict[str, Any]) -> str:
 
 
 def update_job(job_id: str, status: str, result: Dict[str, Any]):
-    """
-    Update job with result
-    
-    Raises ValueError if job doesn't exist
-    """
-    try:
-        if job_id not in jobs:
-            error_msg = f"Cannot update job {job_id} - job not found in jobs dictionary"
-            logger.error(f":x: {error_msg}")
-            raise ValueError(error_msg)
-        
-        # Update the job
+    """Update job with result"""
+    if job_id in jobs:
         jobs[job_id].update({
             "status": status,
             "result": result,
             "completed_at": time.time()
         })
-        
         logger.info(f":white_check_mark: Updated job {job_id} - status: {status}")
-        
-        # Verify the update actually happened
-        if jobs[job_id].get("status") != status:
-            logger.error(f":x: Job {job_id} status mismatch after update! Expected: {status}, Got: {jobs[job_id].get('status')}")
-            raise ValueError(f"Job status update verification failed")
-        
-        logger.info(f":white_check_mark: Verified job {job_id} status is now: {status}")
-        
-    except Exception as e:
-        logger.error(f":x: Failed to update job {job_id}: {e}")
-        raise
+    else:
+        logger.warning(f":warning: Attempted to update non-existent job {job_id}")
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
     """Get job status"""
     return jobs.get(job_id)
-
-
-# Watchdog for auto-fixing stuck jobs
-watchdog_running = False
-
-
-async def job_watchdog():
-    """
-    Watchdog that periodically checks for stuck jobs and fixes them
-    Runs every 30 seconds, fixes jobs stuck in 'processing' for >5 minutes
-    """
-    global watchdog_running
-    watchdog_running = True
-    
-    logger.info(":dog: Job watchdog started - checking every 30 seconds for jobs stuck >5 minutes")
-    
-    while watchdog_running:
-        try:
-            await asyncio.sleep(30)  # Check every 30 seconds
-            
-            current_time = time.time()
-            stuck_jobs = []
-            
-            for job_id, job in list(jobs.items()):  # Use list() to avoid dict change during iteration
-                if job.get("status") == "processing":
-                    created_at = job.get("created_at", current_time)
-                    elapsed = current_time - created_at
-                    
-                    # If stuck in processing for >5 minutes, force fix
-                    if elapsed > 300:  # 5 minutes
-                        stuck_jobs.append((job_id, elapsed))
-            
-            if stuck_jobs:
-                logger.warning(f":warning: Watchdog found {len(stuck_jobs)} stuck job(s)")
-                
-                for job_id, elapsed in stuck_jobs:
-                    minutes = int(elapsed / 60)
-                    logger.warning(f":ambulance: Watchdog auto-fixing job {job_id} (stuck for {minutes} minutes)")
-                    
-                    ticket_id = jobs[job_id].get("ticket_id")
-                    
-                    # Force update to error (direct dictionary update)
-                    jobs[job_id]["status"] = "error"
-                    jobs[job_id]["result"] = {
-                        "status": "error",
-                        "error": f"Job was stuck in 'processing' state for {minutes} minutes ({elapsed:.0f} seconds). Auto-fixed by watchdog. Background task likely failed to update status.",
-                        "ticket_id": ticket_id,
-                        "watchdog_fixed": True
-                    }
-                    jobs[job_id]["completed_at"] = current_time
-                    
-                    logger.info(f":white_check_mark: Watchdog fixed job {job_id}")
-        
-        except Exception as e:
-            logger.error(f":x: Watchdog error: {e}")
-            logger.exception("Watchdog exception:")
-            # Continue running despite errors
-    
-    logger.info(":dog: Job watchdog stopped")
 
 
 async def resolve_channel_id(client: AsyncWebClient, channel_name_or_id: str) -> str:
@@ -1224,13 +1083,11 @@ async def startup_event():
     
     base_url = public_url if public_url else f"http://localhost:{port}"
     logger.info(":mailbox_with_mail: Endpoints:")
-    logger.info(f"   Health Check:       GET    {base_url}/")
-    logger.info(f"   Zendesk Webhook:    POST   {base_url}/zendesk/webhook")
-    logger.info(f"   Get Ticket:         GET    {base_url}/zendesk/ticket/{{ticket_id}}")
-    logger.info(f"   Test Endpoint:      POST   {base_url}/zendesk/test")
-    logger.info(f"   Job Status:         GET    {base_url}/zendesk/job/{{job_id}}")
-    logger.info(f"   List Jobs:          GET    {base_url}/zendesk/jobs (admin)")
-    logger.info(f"   Delete Job:         DELETE {base_url}/zendesk/job/{{job_id}} (admin)")
+    logger.info(f"   Health Check:       GET  {base_url}/")
+    logger.info(f"   Zendesk Webhook:    POST {base_url}/zendesk/webhook")
+    logger.info(f"   Get Ticket:         GET  {base_url}/zendesk/ticket/{{ticket_id}}")
+    logger.info(f"   Test Endpoint:      POST {base_url}/zendesk/test")
+    logger.info(f"   Job Status:         GET  {base_url}/zendesk/job/{{job_id}}")
     logger.info("")
     logger.info(f":stopwatch:  Bart timeout: {bart_timeout:.0f} seconds ({bart_timeout/60:.1f} minutes)")
     logger.info(f":stopwatch:  Bart completion wait: {bart_completion_wait:.0f} seconds ({bart_completion_wait/60:.1f} minutes)")
@@ -1239,18 +1096,11 @@ async def startup_event():
     logger.info(f":test_tube:  Test endpoint TTL: {test_processing_ttl:.0f} seconds ({test_processing_ttl/60:.1f} minutes)")
     logger.info(f":speech_balloon:  Bart comment check window: {bart_comment_check_hours} hours")
     logger.info("=" * 80)
-    
-    # Start job watchdog
-    asyncio.create_task(job_watchdog())
-    logger.info(":dog: Job watchdog task created - will auto-fix stuck jobs every 30 seconds")
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
     """Cleanup on shutdown"""
-    global watchdog_running
-    watchdog_running = False
-    
     if bart_client:
         await bart_client.disconnect()
     logger.info(":wave: Bart Zendesk Webhook Handler shut down")
@@ -1456,109 +1306,31 @@ async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
         
         # Wrapper to catch background task errors and update job
         async def safe_process_with_job():
-            job_updated = False  # Track if we've updated the job
-            
             try:
-                logger.info(f":robot_face: [{job_id}] Starting webhook processing...")
-                
                 result = await webhook_handler.process_ticket_event(
                     normalized_payload, 
                     zendesk_subdomain, 
                     add_comment=add_comment
                 )
                 
-                logger.info(f":white_check_mark: [{job_id}] process_ticket_event completed with status: {result.get('status')}")
-                
                 # Update job with result
-                try:
-                    if result["status"] == "success":
-                        logger.info(f":floppy_disk: [{job_id}] Updating job to 'complete'...")
-                        update_job(job_id, "complete", result)
-                        job_updated = True
-                    elif result["status"] == "skipped":
-                        logger.info(f":floppy_disk: [{job_id}] Updating job to 'skipped'...")
-                        update_job(job_id, "skipped", result)
-                        job_updated = True
-                    else:
-                        logger.info(f":floppy_disk: [{job_id}] Updating job to 'error'...")
-                        update_job(job_id, "error", result)
-                        job_updated = True
-                    
-                    logger.info(f":white_check_mark: [{job_id}] Job status updated successfully")
-                except Exception as update_error:
-                    logger.error(f":x: [{job_id}] Failed to update job status: {update_error}")
-                    logger.exception("Update job error:")
-                    # Don't set job_updated=True, let finally block handle it
+                if result["status"] == "success":
+                    update_job(job_id, "complete", result)
+                elif result["status"] == "skipped":
+                    update_job(job_id, "skipped", result)
+                else:
+                    update_job(job_id, "error", result)
                     
             except Exception as e:
-                logger.error(f":x: [{job_id}] Background task error processing ticket #{ticket_id}: {e}")
+                logger.error(f":x: Background task error processing ticket #{ticket_id}: {e}")
                 logger.exception("Full traceback:")
-                
-                try:
-                    update_job(job_id, "error", {
-                        "status": "error",
-                        "error": str(e),
-                        "ticket_id": ticket_id
-                    })
-                    job_updated = True
-                    logger.info(f":white_check_mark: [{job_id}] Job status updated to 'error' after exception")
-                except Exception as update_error:
-                    logger.error(f":x: [{job_id}] Failed to update job even in exception handler: {update_error}")
-                    # Don't set job_updated=True, let finally block handle it
-            
-            finally:
-                # CRITICAL: Ensure job is always updated
-                if not job_updated:
-                    logger.error(f":rotating_light: [{job_id}] CRITICAL: Job was not updated!")
-                    logger.error(f":rotating_light: [{job_id}] Forcing job status to 'error'")
-                    
-                    # Directly update jobs dictionary (don't call update_job to avoid circular failures)
-                    if job_id in jobs:
-                        try:
-                            jobs[job_id].update({
-                                "status": "error",
-                                "result": {
-                                    "status": "error",
-                                    "error": "Job processing completed but status was not updated (unexpected code path)",
-                                    "ticket_id": ticket_id
-                                },
-                                "completed_at": time.time()
-                            })
-                            logger.info(f":white_check_mark: [{job_id}] Job status force-updated in finally block")
-                        except Exception as final_error:
-                            logger.error(f":rotating_light: [{job_id}] FAILED to update job even in finally block: {final_error}")
-                    else:
-                        logger.error(f":rotating_light: [{job_id}] Job doesn't exist in jobs dictionary!")
-                        logger.error(f":rotating_light: [{job_id}] Job may have been deleted during processing")
-            
-            # Wrap with ultra-defensive wrapper
-            async def ultra_safe_wrapper():
-                """Absolutely ensure job gets updated even if task crashes"""
-                task_crashed = False
-                try:
-                    logger.info(f":rocket: [{job_id}] Ultra-safe wrapper: Starting safe_process_with_job()")
-                    await safe_process_with_job()
-                    logger.info(f":white_check_mark: [{job_id}] Ultra-safe wrapper: safe_process_with_job() completed")
-                except Exception as crash_error:
-                    task_crashed = True
-                    logger.error(f":rotating_light: [{job_id}] === WEBHOOK TASK CRASHED ===")
-                    logger.error(f":rotating_light: [{job_id}] Crash error: {crash_error}")
-                    logger.exception("Webhook task crash:")
-                    
-                    # Emergency update
-                    if job_id in jobs and jobs[job_id].get("status") == "processing":
-                        logger.error(f":ambulance: [{job_id}] Emergency update - webhook task crashed")
-                        jobs[job_id]["status"] = "error"
-                        jobs[job_id]["result"] = {
-                            "status": "error",
-                            "error": f"Webhook background task crashed: {str(crash_error)}",
-                            "ticket_id": ticket_id,
-                            "task_crashed": True
-                        }
-                        jobs[job_id]["completed_at"] = time.time()
-                        logger.info(f":white_check_mark: [{job_id}] Emergency update completed")
+                update_job(job_id, "error", {
+                    "status": "error",
+                    "error": str(e),
+                    "ticket_id": ticket_id
+                })
         
-        background_tasks.add_task(ultra_safe_wrapper)
+        background_tasks.add_task(safe_process_with_job)
         
         # Return immediately with job_id and poll URL
         poll_url = f"/zendesk/job/{job_id}"
@@ -1743,22 +1515,6 @@ async def get_job_status(job_id: str):
     created_at = job.get("created_at")
     elapsed = int(time.time() - created_at)
     
-    # WARNING: If job is stuck in "processing" for >5 minutes, force to error
-    if job_status == "processing" and elapsed > 300:  # 5 minutes
-        logger.warning(f":warning: Job {job_id} stuck in 'processing' for {elapsed}s (>5 min)")
-        logger.warning(f":warning: Force-updating to 'error' state")
-        
-        update_job(job_id, "error", {
-            "status": "error",
-            "error": f"Job timed out - stuck in 'processing' state for {elapsed} seconds (>5 minutes). This likely indicates background task failed to update status.",
-            "ticket_id": ticket_id,
-            "auto_timeout_fix": True
-        })
-        
-        # Re-fetch updated job
-        job = get_job(job_id)
-        job_status = "error"
-    
     if job_status == "processing":
         return {
             "job_id": job_id,
@@ -1791,57 +1547,6 @@ async def get_job_status(job_id: str):
             "ticket_id": ticket_id,
             "message": "Unknown job status"
         }
-
-
-@app.delete("/zendesk/job/{job_id}")
-async def delete_job(job_id: str):
-    """
-    Admin endpoint to manually delete a job
-    
-    Useful for cleaning up stuck jobs or testing.
-    
-    Example:
-        DELETE /zendesk/job/abc-123-def
-    """
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
-    
-    job = jobs.pop(job_id)
-    logger.info(f":wastebasket: Manually deleted job {job_id}")
-    
-    return {
-        "status": "deleted",
-        "job_id": job_id,
-        "was_status": job.get("status"),
-        "message": f"Job {job_id} deleted"
-    }
-
-
-@app.get("/zendesk/jobs")
-async def list_all_jobs():
-    """
-    Admin endpoint to list all jobs (for debugging)
-    
-    Example:
-        GET /zendesk/jobs
-    """
-    cleanup_old_jobs()
-    
-    jobs_list = []
-    for job_id, job in jobs.items():
-        elapsed = int(time.time() - job.get("created_at", time.time()))
-        jobs_list.append({
-            "job_id": job_id,
-            "status": job.get("status"),
-            "ticket_id": job.get("ticket_id"),
-            "elapsed_seconds": elapsed,
-            "created_at": datetime.fromtimestamp(job.get("created_at", time.time()), tz=timezone.utc).isoformat()
-        })
-    
-    return {
-        "total_jobs": len(jobs_list),
-        "jobs": jobs_list
-    }
 
 
 @app.post("/zendesk/test")
@@ -1965,17 +1670,12 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
             
             async def process_with_job_updates():
                 """Process question and update job status"""
-                logger.info(f"")
-                logger.info(f"{'='*80}")
-                logger.info(f":robot_face: [{job_id}] === BACKGROUND TASK STARTED ===")
-                logger.info(f"{'='*80}")
                 logger.info(f":robot_face: [{job_id}] Starting async processing with polling...")
                 logger.info(f":memo: add_comment parameter: {add_comment}")
                 logger.info(f":zap: force_reprocess parameter: {force_reprocess}")
                 
                 request_id = str(uuid.uuid4())[:8]
                 start_time = time.time()
-                job_updated = False  # Track if we've updated the job
                 
                 try:
                     # Determine TTL
@@ -1986,37 +1686,21 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                         custom_ttl = bart_client.test_processing_ttl
                         logger.info(f":stopwatch: [{job_id}] Using test endpoint TTL: {custom_ttl:.0f} seconds ({custom_ttl/60:.1f} minutes)")
                     
-                    # Ask Bart with timeout protection
-                    logger.info(f":outbox_tray: [{job_id}] Calling bart_client.ask()...")
-                    logger.info(f":alarm_clock: [{job_id}] Timeout limit: 650 seconds (~11 minutes)")
-                    
-                    try:
-                        # Wrap in asyncio timeout (650 seconds = slightly longer than Bart's 600s internal timeout)
-                        result = await asyncio.wait_for(
-                            bart_client.ask(
-                                question, 
-                                ticket_id=ticket_id or 99999, 
-                                request_id=request_id,
-                                custom_ttl=custom_ttl
-                            ),
-                            timeout=650.0  # 650 seconds (~11 minutes)
-                        )
-                    except asyncio.TimeoutError:
-                        logger.error(f":alarm_clock: [{job_id}] === ASYNCIO TIMEOUT AFTER 650 SECONDS ===")
-                        logger.error(f":alarm_clock: [{job_id}] bart_client.ask() hung and did not return")
-                        logger.error(f":alarm_clock: [{job_id}] This likely means Bart responded but message detection failed")
-                        raise TimeoutError("bart_client.ask() exceeded 650 second timeout - likely stuck in _wait_for_completion() waiting for messages")
-                    
+                    # Ask Bart
+                    result = await bart_client.ask(
+                        question, 
+                        ticket_id=ticket_id or 99999, 
+                        request_id=request_id,
+                        custom_ttl=custom_ttl
+                    )
                     response = result["response"]
                     slack_thread_url = result.get("slack_thread_url", "")
                     elapsed = time.time() - start_time
                     
                     logger.info(f":white_check_mark: [{job_id}] Bart responded in {elapsed:.1f} seconds")
-                    logger.info(f":white_check_mark: [{job_id}] Response length: {len(response)} characters")
                     
                     # Add comment if requested
                     if ticket_id and add_comment:
-                        logger.info(f":memo: [{job_id}] Adding comment to Zendesk ticket #{ticket_id}...")
                         formatted_response = (
                             f":robot_face: *Bart's Response (Test):*\n\n{response}\n\n"
                             f"---\n_Test response at {datetime.now(timezone.utc).isoformat()}Z_"
@@ -2028,145 +1712,41 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                         logger.info(f":white_check_mark: [{job_id}] Comment added to Zendesk")
                     
                     # Update job with success result
-                    logger.info(f":floppy_disk: [{job_id}] Updating job status to 'complete'...")
-                    try:
-                        update_job(job_id, "complete", {
-                            "status": "success",
-                            "response": response,
-                            "deployment_type": webhook_handler.detect_deployment_type(tags),
-                            "ticket_id": ticket_id,
-                            "ticket_updated": ticket_id is not None and add_comment,
-                            "comment_added": add_comment if ticket_id else False,
-                            "force_reprocess": force_reprocess,
-                            "processing_time_seconds": elapsed,
-                            "slack_thread_url": slack_thread_url
-                        })
-                        job_updated = True
-                        logger.info(f":white_check_mark: [{job_id}] Job status updated to 'complete'")
-                    except Exception as update_error:
-                        logger.error(f":x: [{job_id}] Failed to update job status: {update_error}")
-                        logger.exception("Update job error:")
-                        # Don't set job_updated=True, let finally block handle it
+                    update_job(job_id, "complete", {
+                        "status": "success",
+                        "response": response,
+                        "deployment_type": webhook_handler.detect_deployment_type(tags),
+                        "ticket_id": ticket_id,
+                        "ticket_updated": ticket_id is not None and add_comment,
+                        "comment_added": add_comment if ticket_id else False,
+                        "force_reprocess": force_reprocess,
+                        "processing_time_seconds": elapsed,
+                        "slack_thread_url": slack_thread_url
+                    })
                 
                 except ValueError as e:
                     # Deduplication error
                     error_msg = str(e)
                     logger.warning(f":warning: [{job_id}] Deduplication check failed: {error_msg}")
                     
-                    try:
-                        update_job(job_id, "skipped", {
-                            "status": "skipped",
-                            "error": error_msg,
-                            "ticket_id": ticket_id
-                        })
-                        job_updated = True
-                        logger.info(f":white_check_mark: [{job_id}] Job status updated to 'skipped'")
-                    except Exception as update_error:
-                        logger.error(f":x: [{job_id}] Failed to update job to 'skipped': {update_error}")
-                        # Don't set job_updated=True, let finally block handle it
-                
-                except (TimeoutError, asyncio.TimeoutError) as e:
-                    # Timeout from asyncio.wait_for or Bart's internal timeout
-                    logger.error(f":alarm_clock: [{job_id}] TIMEOUT: bart_client.ask() exceeded time limit")
-                    logger.error(f":alarm_clock: [{job_id}] Timeout error: {e}")
-                    
-                    try:
-                        update_job(job_id, "error", {
-                            "status": "error",
-                            "error": f"Timeout: bart_client.ask() hung for >12 minutes. Bart may have responded but message detection failed. Original error: {str(e)}",
-                            "ticket_id": ticket_id,
-                            "timeout_error": True
-                        })
-                        job_updated = True
-                        logger.info(f":white_check_mark: [{job_id}] Job status updated to 'error' (timeout)")
-                    except Exception as update_error:
-                        logger.error(f":x: [{job_id}] Failed to update job after timeout: {update_error}")
-                        # Don't set job_updated=True, let finally block handle it
+                    update_job(job_id, "skipped", {
+                        "status": "skipped",
+                        "error": error_msg,
+                        "ticket_id": ticket_id
+                    })
                 
                 except Exception as e:
                     logger.error(f":x: [{job_id}] Error in async processing: {e}")
                     logger.exception("Full traceback:")
                     
-                    try:
-                        update_job(job_id, "error", {
-                            "status": "error",
-                            "error": str(e),
-                            "ticket_id": ticket_id
-                        })
-                        job_updated = True
-                        logger.info(f":white_check_mark: [{job_id}] Job status updated to 'error'")
-                    except Exception as update_error:
-                        logger.error(f":x: [{job_id}] Failed to update job to 'error': {update_error}")
-                        # Don't set job_updated=True, let finally block handle it
-                
-                finally:
-                    # CRITICAL: Ensure job is always updated, even if update_job() itself fails
-                    if not job_updated:
-                        logger.error(f":rotating_light: [{job_id}] CRITICAL: Job was not updated by exception handlers!")
-                        logger.error(f":rotating_light: [{job_id}] Forcing job status to 'error' to prevent stuck 'processing' state")
-                        
-                        # Directly update jobs dictionary (don't call update_job to avoid circular failures)
-                        if job_id in jobs:
-                            try:
-                                jobs[job_id].update({
-                                    "status": "error",
-                                    "result": {
-                                        "status": "error",
-                                        "error": "Job processing completed but status was not updated (unexpected error path)",
-                                        "ticket_id": ticket_id
-                                    },
-                                    "completed_at": time.time()
-                                })
-                                logger.info(f":white_check_mark: [{job_id}] Job status force-updated to 'error' in finally block")
-                            except Exception as final_error:
-                                logger.error(f":rotating_light: [{job_id}] FAILED to update job even in finally block: {final_error}")
-                        else:
-                            logger.error(f":rotating_light: [{job_id}] Job doesn't exist in jobs dictionary!")
-                            logger.error(f":rotating_light: [{job_id}] Job may have been deleted or never created")
-                    
-                    logger.info(f"")
-                    logger.info(f"{'='*80}")
-                    logger.info(f":checkered_flag: [{job_id}] === BACKGROUND TASK COMPLETED ===")
-                    logger.info(f":mag: [{job_id}] Final job status: {jobs.get(job_id, {}).get('status', 'JOB_NOT_FOUND')}")
-                    logger.info(f"{'='*80}")
-                    logger.info(f"")
+                    update_job(job_id, "error", {
+                        "status": "error",
+                        "error": str(e),
+                        "ticket_id": ticket_id
+                    })
             
-            # Wrap with ultra-defensive wrapper
-            async def ultra_safe_task_wrapper():
-                """Absolutely ensure job status gets updated even if task crashes"""
-                task_crashed = False
-                try:
-                    logger.info(f":rocket: [{job_id}] Ultra-safe wrapper: Starting process_with_job_updates()")
-                    await process_with_job_updates()
-                    logger.info(f":white_check_mark: [{job_id}] Ultra-safe wrapper: process_with_job_updates() completed normally")
-                except Exception as crash_error:
-                    task_crashed = True
-                    logger.error(f":rotating_light: [{job_id}] === BACKGROUND TASK CRASHED ===")
-                    logger.error(f":rotating_light: [{job_id}] Task crash error: {crash_error}")
-                    logger.exception("Background task crash traceback:")
-                    
-                    # Emergency job update
-                    if job_id in jobs and jobs[job_id].get("status") == "processing":
-                        logger.error(f":ambulance: [{job_id}] Emergency update - task crashed, job still 'processing'")
-                        jobs[job_id]["status"] = "error"
-                        jobs[job_id]["result"] = {
-                            "status": "error",
-                            "error": f"Background task crashed with exception: {str(crash_error)}",
-                            "ticket_id": ticket_id,
-                            "task_crashed": True
-                        }
-                        jobs[job_id]["completed_at"] = time.time()
-                        logger.info(f":white_check_mark: [{job_id}] Emergency update completed in crash handler")
-                finally:
-                    if task_crashed:
-                        logger.error(f":x: [{job_id}] Wrapper finally: Task crashed")
-                    else:
-                        logger.info(f":white_check_mark: [{job_id}] Wrapper finally: Task completed normally")
-            
-            # Start background processing with wrapper
-            logger.info(f":rocket: [{job_id}] Adding ultra_safe_task_wrapper to background_tasks...")
-            background_tasks.add_task(ultra_safe_task_wrapper)
-            logger.info(f":white_check_mark: [{job_id}] Background task added successfully")
+            # Start background processing
+            background_tasks.add_task(process_with_job_updates)
             
             # Return immediately (202 Accepted) with polling URL
             poll_url = f"/zendesk/job/{job_id}"
