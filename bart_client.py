@@ -337,10 +337,20 @@ class BartClient:
             time_since_last = time.time() - last_message_time
             has_final = any(msg["is_final"] for msg in messages)
             
+            # NEW: If we have a VERY long message (>1000 chars), consider it immediately final
+            # Don't wait for completion_wait - it's clearly substantive content
+            very_long_messages = [msg for msg in messages if len(msg["text"]) > 1000]
+            if very_long_messages and time_since_last > 10:  # Just 10 seconds after long message
+                logger.info(f":zap: [{request_id}] Detected very long message ({len(very_long_messages[0]['text'])} chars)")
+                logger.info(f":zap: [{request_id}] Early exit - not waiting full completion_wait")
+                return
+            
+            # If we have a final message and no new messages for completion_wait seconds
             if has_final and time_since_last > self.completion_wait:
                 logger.info(f":white_check_mark: [{request_id}] Bart appears to be done (no messages for {time_since_last:.1f}s, have final message)")
                 return
             
+            # Fallback: If no final message detected but we've been waiting a long time
             if time_since_last > self.fallback_wait:
                 logger.warning(f":warning: [{request_id}] No new messages for {time_since_last:.1f}s but no final message detected")
                 return
