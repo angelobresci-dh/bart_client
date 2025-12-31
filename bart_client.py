@@ -139,36 +139,43 @@ class BartClient:
         # Explicit final message indicators (these are NOT working messages)
         final_indicators = [
             "All repos already up-to-date",
-            ":white_check_mark: All repos already up-to-date"
+            ":white_check_mark: All repos already up-to-date",
+            "Got it!",  # Bart's typical response starter
+            "Based on",  # Bart providing analysis
+            "Here's what",  # Bart explaining
+            "The issue",  # Bart diagnosing
+            "Response:",  # Explicit response section
         ]
         
         for indicator in final_indicators:
             if indicator in text:
                 return False  # This is a final message, not a working message
         
-        if not text or len(text.strip()) < 80:
+        # Very short messages are working messages
+        if not text or len(text.strip()) < 50:
             return True
         
-        # IMPORTANT: If message is long (200+ chars), it's substantive content
-        # even if it contains words like "Looking" or "Analyzing"
-        if len(text.strip()) >= 200:
+        # CRITICAL: If message is long (>300 chars), it's DEFINITELY substantive content
+        # Even if it contains "Let me" or "Looking" - those are just conversational
+        if len(text.strip()) >= 300:
             return False
         
+        # Medium length (50-300 chars) - check for working indicators
         working_indicators = [
             r":mag:",
             r":mag_right:",
             r"\bSearching\b",
-            r"\bLooking\b",
             r"\bAnalyzing\b",
-            r"\bLet me\b",
             r"\bChecking\b",
             r"\bFinding\b",
             r"\bExploring\b",
             r"Ay caramba",
             r"Don't have a cow",
-            r"checking the code"
+            r"checking the code",
+            r"^Let me\s+(search|check|find|look)",  # Only "Let me search/check/find" at start
         ]
         
+        # Only check patterns for medium-length messages
         for pattern in working_indicators:
             if re.search(pattern, text, re.IGNORECASE):
                 return True
@@ -185,28 +192,39 @@ class BartClient:
         """
         Detect if this looks like a final, complete message from Bart.
         Returns True if message appears to be a complete response.
-        Less strict criteria - just needs to be substantial and not a working message.
+        VERY LENIENT - better to capture too early than wait forever.
         """
         # Explicit final message indicators
         final_indicators = [
             "All repos already up-to-date",
-            ":white_check_mark: All repos already up-to-date"
+            ":white_check_mark: All repos already up-to-date",
+            "Got it!",
+            "Response:",
+            "Here's what's happening",
+            "Based on",
         ]
         
         for indicator in final_indicators:
             if indicator in text:
                 return True  # Definitely a final message
         
-        if not text or len(text) < 50:  # Reduced threshold
+        # Very short messages are not final
+        if not text or len(text) < 50:
             return False
         
+        # If it's a working message, it's not final
         if self.is_working_message(text):
             return False
         
-        # More lenient - any substantial message that's not a working message
-        # could be a final message (Bart may send multiple final messages)
+        # CRITICAL: Any message >500 chars is DEFINITELY final
+        # Don't wait for more - this is substantive content
+        if len(text.strip()) >= 500:
+            return True
+        
+        # Medium messages (50-500 chars) - check for completion indicators
         has_substance = len(text) > 50
         not_trailing_dots = not text.strip().endswith("...")
+        has_formatting = any(marker in text for marker in ["**", "```", "*", "- ", "1.", "2.", "###"])
         
         return has_substance and not_trailing_dots
     
