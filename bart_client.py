@@ -389,7 +389,7 @@ class BartClient:
             logger.info(f":outbox_tray: [{request_id}] Question too long ({len(formatted_question)} chars), using file attachment")
             
             # Create summary message
-            summary = f"<@{self.BART_USER_ID}> Please review the attached ticket details and provide your response."
+            summary = f"<@{self.BART_USER_ID}> Please review the ticket details in the text file attached to this message and provide your response. Instructions for your response are also included at the end of the text file."
             
             # Upload the full question as a text file
             try:
