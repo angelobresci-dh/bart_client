@@ -696,6 +696,8 @@ Instructions for your response:
 - Exclude any follow-up questions like 'Would you like more detail?' or 'Would you like me to create a GitHub issue to track this, or would you prefer to engage with your Acryl support team directly to get a fix prioritized?' from your response. This exchange will be terminated after your first response.
 - Please note that my request originated from this ticket: <{ticket_url}>. DO NOT use Zendesk ticket {ticket_id} as a reference or source in your response, because you will be self-referencing.
 - The customer is using DataHub {deployment_type.replace('_', ' ').title()}. Please tailor your response accordingly.
+
+- Finally, please add a separate and brief SECOND section to your response. In this second section, please give your analysis as to whether or not the reported issue is a product regression compared to earlier versions (If you believe the reported issue to be a product bug or failure). Provide a "Percentage likelihood that this is a product regression," along with citations of documents or artifacts that led you to this conclusion. This can include references in our documentation to the feature previously working and/or being supported, as well as previous related tickets in Zendesk and Linear indicating it was operation. Please make sure this section is clearly delineated from the first 'Main' section.
 """
         question_parts.append(additional_instructions)
         
