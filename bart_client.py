@@ -1,27 +1,31 @@
 #!/usr/bin/env python3
 """
-Zendesk Webhook Handler for Bart Integration
-Receives Zendesk ticket create/update webhooks, processes them with Bart,
-and updates tickets with Bart's responses.
+Zendesk Webhook Handler for Bart Integration - COMPLETE MERGED VERSION
+Combines original job tracking with today's improvements:
+- Block text extraction for long messages
+- Regression analysis prompts
+- Emoji decoding and formatting
+- Increased Zendesk timeout
 
 Requirements:
-    pip install fastapi uvicorn slack-bolt slack-sdk python-dotenv httpx zenpy
+    pip install fastapi uvicorn slack-bolt slack-sdk python-dotenv zenpy aiohttp
 
 Environment Variables:
     SLACK_BOT_TOKEN - Slack Bot User OAuth Token (xoxb-...)
     SLACK_APP_TOKEN - Slack App-Level Token for Socket Mode (xapp-...)
-    SLACK_CHANNEL_ID - Channel ID (e.g., "C123456789") OR
-    SLACK_CHANNEL_NAME - Channel name (e.g., "bart-bot-to-python" or "#bart-bot-to-python")
-    ZENDESK_SUBDOMAIN - Your Zendesk subdomain (e.g., "acrylsupport")
+    SLACK_CHANNEL_ID - Channel ID OR
+    SLACK_CHANNEL_NAME - Channel name
+    ZENDESK_SUBDOMAIN - Your Zendesk subdomain
     ZENDESK_EMAIL - Zendesk admin email
     ZENDESK_API_TOKEN - Zendesk API token
-    ZENDESK_WEBHOOK_SECRET - Optional: Secret for validating webhook signatures
-    PUBLIC_URL - Optional: Public URL for endpoint display
-    BART_TIMEOUT - Optional: Timeout in seconds for Bart responses (default: 600, i.e., 10 minutes)
-    BART_COMPLETION_WAIT - Optional: Seconds to wait after last message with final response (default: 120, i.e., 2 minutes)
-    BART_FALLBACK_WAIT - Optional: Seconds to wait if no final message detected (default: 540, i.e., 9 minutes)
-    PROCESSING_HISTORY_TTL - Optional: Seconds to keep processing history for deduplication (default: 3600, i.e., 1 hour)
-    BART_COMMENT_CHECK_HOURS - Optional: Hours to check for existing Bart comments before reprocessing (default: 24 hours)
+    ZENDESK_WEBHOOK_SECRET - Optional: Webhook signature secret
+    PUBLIC_URL - Optional: Public URL
+    BART_TIMEOUT - Default: 600
+    BART_COMPLETION_WAIT - Default: 120
+    BART_FALLBACK_WAIT - Default: 540
+    PROCESSING_HISTORY_TTL - Default: 3600 (1 hour)
+    TEST_PROCESSING_TTL - Default: 300 (5 minutes for test endpoint)
+    BART_COMMENT_CHECK_HOURS - Default: 24
 """
 import asyncio
 import os
@@ -31,7 +35,7 @@ import hmac
 import time
 import uuid
 from typing import Optional, Dict, Any
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
 from slack_sdk.web.async_client import AsyncWebClient
@@ -54,7 +58,8 @@ class BartClient:
     """Async Bart client using WebSocket (Socket Mode) with smart message collection"""
     BART_USER_ID = "U09RYUJDUQL"
     
-    def __init__(self, bot_token: str, app_token: str, channel_id: str, timeout: float = 600.0, completion_wait: float = 120.0, fallback_wait: float = 540.0):
+    def __init__(self, bot_token: str, app_token: str, channel_id: str, timeout: float = 600.0, 
+                 completion_wait: float = 120.0, fallback_wait: float = 540.0):
         self.client = AsyncWebClient(token=bot_token)
         self.app = AsyncApp(token=bot_token)
         self.app_token = app_token
@@ -64,11 +69,12 @@ class BartClient:
         self.fallback_wait = fallback_wait
         self.handler: Optional[AsyncSocketModeHandler] = None
         self.pending_responses = {}
-        self.active_tickets = set()  # Track tickets currently being processed
-        self.processed_tickets = {}  # Track recently processed tickets: {ticket_id: timestamp}
-        self.processing_history_ttl = 3600  # Keep history for 1 hour
+        self.active_tickets = set()
+        self.processed_tickets = {}
+        self.processing_history_ttl = 3600
+        self.test_processing_ttl = 300
         
-        # Register UNIFIED message handler that handles both new messages AND edits
+        # Register message handler
         self.app.event("message")(self._handle_message)
     
     def _cleanup_processing_history(self):
@@ -81,33 +87,37 @@ class BartClient:
         for ticket_id in expired_tickets:
             self.processed_tickets.pop(ticket_id, None)
     
-    def was_recently_processed(self, ticket_id: int) -> bool:
-        """Check if ticket was processed recently (within TTL window)"""
+    def was_recently_processed(self, ticket_id: int, custom_ttl: Optional[float] = None) -> bool:
+        """Check if ticket was processed recently"""
         self._cleanup_processing_history()
-        return ticket_id in self.processed_tickets
+        
+        if custom_ttl == 0:
+            return False
+        
+        if ticket_id not in self.processed_tickets:
+            return False
+        
+        ttl = custom_ttl if custom_ttl is not None else self.processing_history_ttl
+        time_since = time.time() - self.processed_tickets[ticket_id]
+        
+        return time_since < ttl
     
     def mark_as_processed(self, ticket_id: int):
-        """Mark ticket as processed with current timestamp"""
+        """Mark ticket as processed"""
         self.processed_tickets[ticket_id] = time.time()
-        logger.info(f":memo: Marked ticket {ticket_id} as processed (history size: {len(self.processed_tickets)})")
+        logger.info(f":memo: Marked ticket {ticket_id} as processed")
     
     async def connect(self):
-        """Establish WebSocket connection and join channel"""
-        # Configure Socket Mode with longer ping interval for long-running operations
-        self.handler = AsyncSocketModeHandler(
-            self.app, 
-            self.app_token,
-            ping_interval=30  # Increase from default to keep connection alive
-        )
+        """Establish WebSocket connection"""
+        self.handler = AsyncSocketModeHandler(self.app, self.app_token)
         await self.handler.connect_async()
         logger.info(":white_check_mark: Connected to Slack via WebSocket")
         
-        # Auto-join channel if not already a member
         try:
             await self.client.conversations_join(channel=self.channel_id)
             logger.info(f":white_check_mark: Joined channel {self.channel_id}")
         except Exception as e:
-            logger.warning(f":warning: Could not auto-join channel (may already be a member): {e}")
+            logger.warning(f":warning: Could not join channel: {e}")
     
     async def disconnect(self):
         """Close WebSocket connection"""
@@ -116,11 +126,7 @@ class BartClient:
             logger.info(":x: Disconnected from Slack")
     
     def is_working_message(self, text: str) -> bool:
-        """
-        Detect if this is a "working on it" message that should be filtered out.
-        Returns True if message indicates Bart is still working.
-        """
-        # Explicit final message indicators (these are NOT working messages)
+        """Detect if message is a working status update"""
         final_indicators = [
             "All repos already up-to-date",
             ":white_check_mark: All repos already up-to-date"
@@ -128,69 +134,30 @@ class BartClient:
         
         for indicator in final_indicators:
             if indicator in text:
-                return False  # This is a final message, not a working message
+                return False
         
         if not text or len(text.strip()) < 80:
             return True
         
-        # CRITICAL: Check for DEFINITIVE working patterns FIRST
-        # These are ALWAYS working messages regardless of length
-        definitive_working_indicators = [
-            r":hourglass:",
-            r":hourglass_flowing_sand:",
-            r"Synthesizing insights",
-            r"✓ Searching",
-            r"✓.*Searching",
-            r":mag:.*Searching",
-            r"Searching.*tickets",
-            r"Searching.*calls",
-        ]
-        
-        for pattern in definitive_working_indicators:
-            if re.search(pattern, text, re.IGNORECASE):
-                return True  # ALWAYS working, even if long
-        
-        # THEN apply length override for other patterns
-        # If message is long (200+ chars), it's substantive content
-        # UNLESS it matched definitive working patterns above
         if len(text.strip()) >= 200:
             return False
         
-        # Check regular working indicators (only for shorter messages now)
         working_indicators = [
-            r":mag:",
-            r":mag_right:",
-            r"\bSearching\b",
-            r"\bLooking\b",
-            r"\bAnalyzing\b",
-            r"\bLet me\b",
-            r"\bChecking\b",
-            r"\bFinding\b",
-            r"\bExploring\b",
-            r"Ay caramba",
-            r"Don't have a cow",
-            r"checking the code"
+            r":mag:", r"\bSearching\b", r"\bLooking\b", r"\bAnalyzing\b",
+            r"\bChecking\b", r"Ay caramba", r"Don't have a cow"
         ]
         
         for pattern in working_indicators:
             if re.search(pattern, text, re.IGNORECASE):
                 return True
         
-        if text.strip() in ["...", "…", ".", "..", "...."]:
-            return True
-        
-        if text.strip().endswith("......") or text.strip().endswith(".....") or text.strip().endswith("...."):
+        if text.strip().endswith("..."):
             return True
         
         return False
     
     def is_final_message(self, text: str) -> bool:
-        """
-        Detect if this looks like a final, complete message from Bart.
-        Returns True if message appears to be a complete response.
-        Less strict criteria - just needs to be substantial and not a working message.
-        """
-        # Explicit final message indicators
+        """Detect if message is a final response"""
         final_indicators = [
             "All repos already up-to-date",
             ":white_check_mark: All repos already up-to-date"
@@ -198,34 +165,25 @@ class BartClient:
         
         for indicator in final_indicators:
             if indicator in text:
-                return True  # Definitely a final message
+                return True
         
-        if not text or len(text) < 50:  # Reduced threshold
+        if not text or len(text) < 50:
             return False
         
         if self.is_working_message(text):
             return False
         
-        # More lenient - any substantial message that's not a working message
-        # could be a final message (Bart may send multiple final messages)
-        has_substance = len(text) > 50
-        not_trailing_dots = not text.strip().endswith("...")
-        
-        return has_substance and not_trailing_dots
+        return len(text) > 50 and not text.strip().endswith("...")
     
     async def _handle_message(self, event):
         """
-        UNIFIED message handler that handles BOTH new messages AND edits.
-        This handles:
-        - Regular messages (subtype is None)
-        - Message edits (subtype == "message_changed")
+        UNIFIED message handler - handles new messages AND edits
+        IMPROVEMENT 1: Block text extraction for long messages
         """
         log = logger
         
-        # Check if this is an edit or a new message
         subtype = event.get("subtype")
         if subtype == "message_changed":
-            # MESSAGE EDIT - extract from nested 'message' object
             message = event.get("message", {})
             user_id = message.get("user")
             text = message.get("text", "")
@@ -234,7 +192,6 @@ class BartClient:
             is_edit = True
             event_type_label = "EDIT"
         else:
-            # NEW MESSAGE - extract from top level
             user_id = event.get("user")
             text = event.get("text", "")
             thread_ts = event.get("thread_ts")
@@ -242,30 +199,24 @@ class BartClient:
             is_edit = False
             event_type_label = "NEW"
         
-        # Debug logging for file upload threads
         if user_id == self.BART_USER_ID:
-            log.info(f":speech_balloon: [{event_type_label}] Message from Bart: user={user_id}, thread_ts={thread_ts}, ts={ts}")
-            log.info(f"   Currently tracking threads: {list(self.pending_responses.keys())}")
+            log.info(f":speech_balloon: [{event_type_label}] Message from Bart: thread_ts={thread_ts}")
         
-        # Only process messages FROM Bart in threads we're tracking
         if user_id == self.BART_USER_ID and thread_ts and thread_ts in self.pending_responses:
             request_id = self.pending_responses[thread_ts].get("request_id", "unknown")
-            log.info(f":incoming_envelope: [{request_id}] Bart message {event_type_label} in thread {thread_ts}")
+            log.info(f":incoming_envelope: [{request_id}] Bart message {event_type_label}")
             
-            # Extract full message text (might be in blocks for long messages)
+            # IMPROVEMENT 1: Extract full text from blocks for long messages
             if subtype == "message_changed":
                 msg_obj = event.get("message", {})
             else:
                 msg_obj = event
             
-            # Try to get full text from blocks if available (for long messages)
             if msg_obj.get("blocks") and len(text) < 1000:
                 try:
-                    # Extract text from all blocks, preserving structure
                     block_texts = []
                     for block in msg_obj.get("blocks", []):
                         if block.get("type") == "rich_text":
-                            # Rich text block - extract all elements
                             section_texts = []
                             for element in block.get("elements", []):
                                 if element.get("type") == "rich_text_section":
@@ -273,7 +224,6 @@ class BartClient:
                                         if item.get("text"):
                                             section_texts.append(item["text"])
                                 elif element.get("type") == "rich_text_list":
-                                    # Handle lists
                                     for list_item in element.get("elements", []):
                                         for item in list_item.get("elements", []):
                                             if item.get("text"):
@@ -281,30 +231,26 @@ class BartClient:
                             if section_texts:
                                 block_texts.append("".join(section_texts))
                         elif block.get("text"):
-                            # Simple text block
                             if isinstance(block["text"], dict):
                                 block_texts.append(block["text"].get("text", ""))
                             else:
                                 block_texts.append(block["text"])
                     
                     if block_texts:
-                        # Join blocks with line breaks to preserve paragraph structure
                         full_text = "\n".join(block_texts)
                         if len(full_text) > len(text):
-                            log.info(f"   :mag: Extracted fuller text from blocks: {len(full_text)} chars (vs {len(text)} in text field)")
+                            log.info(f"   :mag: Extracted fuller text from blocks: {len(full_text)} chars (vs {len(text)})")
                             text = full_text
                 except Exception as e:
                     log.warning(f"   :warning: Failed to extract from blocks: {e}")
             
             log.info(f"   Text preview: {text[:100]}...")
             
-            # Classify message
             is_working = self.is_working_message(text)
             is_final = self.is_final_message(text)
             log.info(f"   Classification: is_working={is_working}, is_final={is_final}, length={len(text)}")
             
             if is_edit:
-                # Find if this timestamp already exists (it's an edit of existing message)
                 messages = self.pending_responses[thread_ts]["messages"]
                 existing_idx = None
                 for idx, msg in enumerate(messages):
@@ -313,44 +259,29 @@ class BartClient:
                         break
                 
                 if existing_idx is not None:
-                    # Update existing message
-                    old_text = messages[existing_idx]["text"]
                     messages[existing_idx] = {
                         "text": text,
                         "ts": ts,
                         "is_working": is_working,
                         "is_final": is_final
                     }
-                    log.info(f"   [{request_id}] :white_check_mark: Updated existing message at index {existing_idx}")
-                    log.info(f"   Old classification: was_working={messages[existing_idx].get('is_working')}, was_final={messages[existing_idx].get('is_final')}")
-                    log.info(f"   New classification: is_working={is_working}, is_final={is_final}")
+                    log.info(f"   [{request_id}] :white_check_mark: Updated message at index {existing_idx}")
                 else:
-                    # New message (shouldn't happen in message_changed, but handle it)
                     self.pending_responses[thread_ts]["messages"].append({
                         "text": text,
                         "ts": ts,
                         "is_working": is_working,
                         "is_final": is_final
                     })
-                    log.info(f"   [{request_id}] :white_check_mark: Added new message (shouldn't happen in edit)")
             else:
-                # New message - check for duplicates first (in case we already got it from fetch)
-                messages = self.pending_responses[thread_ts]["messages"]
-                already_collected = any(m["ts"] == ts for m in messages)
-                
-                if already_collected:
-                    log.info(f"   [{request_id}] :repeat: Skipping duplicate - already collected from fetch")
-                else:
-                    # Add to collection
-                    self.pending_responses[thread_ts]["messages"].append({
-                        "text": text,
-                        "ts": ts,
-                        "is_working": is_working,
-                        "is_final": is_final
-                    })
-                    log.info(f"   [{request_id}] :white_check_mark: Message collected")
+                self.pending_responses[thread_ts]["messages"].append({
+                    "text": text,
+                    "ts": ts,
+                    "is_working": is_working,
+                    "is_final": is_final
+                })
+                log.info(f"   [{request_id}] :white_check_mark: Message collected")
             
-            # Update last message time
             self.pending_responses[thread_ts]["last_message_time"] = time.time()
             log.info(f"   [{request_id}] Total messages: {len(self.pending_responses[thread_ts]['messages'])}")
     
@@ -358,277 +289,121 @@ class BartClient:
         """Wait for Bart to finish responding"""
         request_id = self.pending_responses[thread_ts].get("request_id", "unknown")
         start_time = time.time()
-        last_log_time = time.time()
-        last_fetch_time = time.time()
         
         while True:
             elapsed = time.time() - start_time
             if elapsed > timeout:
-                logger.warning(f":alarm_clock: [{request_id}] Timeout reached after {elapsed:.1f} seconds")
-                raise TimeoutError(f"Bart didn't finish responding within {timeout} seconds")
+                logger.warning(f":alarm_clock: [{request_id}] Timeout after {elapsed:.1f}s")
+                raise TimeoutError(f"Bart didn't finish within {timeout} seconds")
             
             messages = self.pending_responses[thread_ts]["messages"]
             if not messages:
                 await asyncio.sleep(1)
                 continue
             
-            # Periodically re-fetch thread to catch edits that WebSocket might miss
-            if time.time() - last_fetch_time > 15:  # Every 15 seconds
-                try:
-                    logger.info(f":arrows_counterclockwise: [{request_id}] Polling thread for updates (in case WebSocket missed edits)...")
-                    thread_history = await self.client.conversations_replies(
-                        channel=self.channel_id,
-                        ts=thread_ts,
-                        limit=100
-                    )
-                    
-                    thread_messages = thread_history.get("messages", [])[1:]  # Skip our question
-                    for msg in thread_messages:
-                        if msg.get("user") == self.BART_USER_ID:
-                            text = msg.get("text", "")
-                            ts = msg.get("ts")
-                            
-                            # Try to get full text from blocks if available (for long messages)
-                            if msg.get("blocks") and len(text) < 1000:
-                                try:
-                                    block_texts = []
-                                    for block in msg.get("blocks", []):
-                                        if block.get("type") == "rich_text":
-                                            section_texts = []
-                                            for element in block.get("elements", []):
-                                                if element.get("type") == "rich_text_section":
-                                                    for item in element.get("elements", []):
-                                                        if item.get("text"):
-                                                            section_texts.append(item["text"])
-                                                elif element.get("type") == "rich_text_list":
-                                                    for list_item in element.get("elements", []):
-                                                        for item in list_item.get("elements", []):
-                                                            if item.get("text"):
-                                                                section_texts.append(item["text"])
-                                            if section_texts:
-                                                block_texts.append("".join(section_texts))
-                                        elif block.get("text"):
-                                            if isinstance(block["text"], dict):
-                                                block_texts.append(block["text"].get("text", ""))
-                                            else:
-                                                block_texts.append(block["text"])
-                                    
-                                    if block_texts:
-                                        # Join blocks with line breaks to preserve structure
-                                        full_text = "\n".join(block_texts)
-                                        if len(full_text) > len(text):
-                                            logger.info(f":arrows_counterclockwise: [{request_id}] Extracted fuller text from blocks in polling: {len(full_text)} chars (vs {len(text)})")
-                                            text = full_text
-                                except Exception as e:
-                                    logger.warning(f":warning: [{request_id}] Failed to extract from blocks during polling: {e}")
-                            
-                            # Find if this message already exists
-                            existing_idx = None
-                            for idx, m in enumerate(messages):
-                                if m["ts"] == ts:
-                                    existing_idx = idx
-                                    break
-                            
-                            is_working = self.is_working_message(text)
-                            is_final = self.is_final_message(text)
-                            
-                            if existing_idx is not None:
-                                # Update if content changed
-                                if messages[existing_idx]["text"] != text:
-                                    logger.info(f":arrows_counterclockwise: [{request_id}] Updated message via polling (ts: {ts}, is_final={is_final}, length={len(text)})")
-                                    messages[existing_idx] = {
-                                        "text": text,
-                                        "ts": ts,
-                                        "is_working": is_working,
-                                        "is_final": is_final
-                                    }
-                                    self.pending_responses[thread_ts]["last_message_time"] = time.time()
-                            else:
-                                # New message found via polling
-                                logger.info(f":arrows_counterclockwise: [{request_id}] Found new message via polling (ts: {ts}, is_final={is_final}, length={len(text)})")
-                                messages.append({
-                                    "text": text,
-                                    "ts": ts,
-                                    "is_working": is_working,
-                                    "is_final": is_final
-                                })
-                                self.pending_responses[thread_ts]["last_message_time"] = time.time()
-                    
-                    last_fetch_time = time.time()
-                except Exception as e:
-                    logger.warning(f":warning: [{request_id}] Failed to poll thread: {e}")
-            
             last_message_time = self.pending_responses[thread_ts]["last_message_time"]
             time_since_last = time.time() - last_message_time
             has_final = any(msg["is_final"] for msg in messages)
             
             if has_final and time_since_last > self.completion_wait:
-                logger.info(f":white_check_mark: [{request_id}] Bart appears to be done (no messages for {time_since_last:.1f}s, have final message)")
+                logger.info(f":white_check_mark: [{request_id}] Bart done (no messages for {time_since_last:.1f}s)")
                 return
             
             if time_since_last > self.fallback_wait:
-                logger.warning(f":warning: [{request_id}] No new messages for {time_since_last:.1f}s but no final message detected")
+                logger.warning(f":warning: [{request_id}] No messages for {time_since_last:.1f}s")
                 return
             
             await asyncio.sleep(2)
     
     def concatenate_messages(self, thread_ts: str) -> str:
-        """Concatenate all final messages from Bart, falling back to non-working messages"""
+        """Concatenate all final messages from Bart"""
         request_id = self.pending_responses[thread_ts].get("request_id", "unknown")
         messages = self.pending_responses[thread_ts]["messages"]
         
-        # First try to get all FINAL messages
         final_messages = [msg for msg in messages if msg["is_final"]]
         
         if final_messages:
-            # Use all final messages
             final_messages.sort(key=lambda m: m["ts"])
             texts = [msg["text"] for msg in final_messages]
-            complete_response = "\n\n".join(texts)
-            logger.info(f":clipboard: [{request_id}] Concatenated {len(final_messages)} FINAL messages (total messages: {len(messages)})")
-            return complete_response
+            logger.info(f":clipboard: [{request_id}] Concatenated {len(final_messages)} FINAL messages")
+            return "\n\n".join(texts)
         
-        # Fallback: use all non-working messages
         meaningful_messages = [msg for msg in messages if not msg["is_working"]]
         if not meaningful_messages:
-            logger.warning(f":warning: [{request_id}] Only working messages available, using them")
             meaningful_messages = messages
         
         meaningful_messages.sort(key=lambda m: m["ts"])
         texts = [msg["text"] for msg in meaningful_messages]
-        complete_response = "\n\n".join(texts)
-        
-        logger.info(f":clipboard: [{request_id}] Concatenated {len(meaningful_messages)} messages (filtered {len(messages) - len(meaningful_messages)} working messages)")
-        return complete_response
+        logger.info(f":clipboard: [{request_id}] Concatenated {len(meaningful_messages)} messages")
+        return "\n\n".join(texts)
     
     async def _post_question(self, question: str, request_id: str) -> str:
-        """
-        Post question to Slack as a SINGLE message (using file attachment if too long).
-        Returns:
-            str: Message timestamp (thread_ts) to track responses
-        """
-        # Format question with @mention
+        """Post question to Slack"""
         formatted_question = f"<@{self.BART_USER_ID}> {question}"
-        
-        # Slack message limit is 40,000 chars, but we'll be conservative
-        # If message is too long, use file attachment instead
-        MAX_MESSAGE_LENGTH = 3000  # Conservative limit to prevent splitting
+        MAX_MESSAGE_LENGTH = 3000
         
         if len(formatted_question) <= MAX_MESSAGE_LENGTH:
-            # Short enough - post as regular message
-            logger.info(f":outbox_tray: [{request_id}] Posting question to channel {self.channel_id}")
-            logger.info(f"   Question length: {len(formatted_question)} characters")
+            logger.info(f":outbox_tray: [{request_id}] Posting question ({len(formatted_question)} chars)")
             
             send_result = await self.client.chat_postMessage(
                 channel=self.channel_id,
                 text=formatted_question
             )
             
-            logger.info(f":white_check_mark: [{request_id}] Question posted (ts: {send_result['ts']})")
+            logger.info(f":white_check_mark: [{request_id}] Posted (ts: {send_result['ts']})")
             return send_result["ts"]
         
         else:
-            # Too long - post with file attachment
-            logger.info(f":outbox_tray: [{request_id}] Question too long ({len(formatted_question)} chars), using file attachment")
+            logger.info(f":outbox_tray: [{request_id}] Question too long ({len(formatted_question)} chars), using file")
             
-            # Create explicit summary message that tells Bart to read the file
-            summary = f"<@{self.BART_USER_ID}> Please review the ticket details in the text file attached to this message and provide your response. Instructions for your response are also included at the end of the text file."
+            summary = f"<@{self.BART_USER_ID}> Please review the ticket details in the text file attached to this message and provide your response. Instructions are at the end of the file."
             
-            # Upload the full question as a text file
-            try:
-                file_result = await self.client.files_upload_v2(
-                    channel=self.channel_id,
-                    content=question,  # Don't include @mention in file
-                    filename=f"ticket_details_{request_id}.txt",
-                    title=f"Ticket Details (Request {request_id})",
-                    initial_comment=summary
-                )
-                
-                logger.info(f":white_check_mark: [{request_id}] File uploaded successfully")
-                
-                # IMPORTANT: When using initial_comment, files_upload_v2 creates TWO things:
-                # 1. A message with the comment (this is what Bart replies to)
-                # 2. A file attachment
-                # We need the timestamp of the COMMENT MESSAGE, not the file.
-                # The most reliable way is to fetch it from conversations history.
-                
-                # Wait a moment for the message to appear in history
-                await asyncio.sleep(0.5)
-                
-                # Get the most recent message from the channel (should be our comment)
-                history_response = await self.client.conversations_history(
-                    channel=self.channel_id,
-                    limit=1
-                )
-                
-                if not history_response.get("messages"):
-                    raise ValueError("No messages found in conversation history after file upload")
-                
-                latest_message = history_response["messages"][0]
-                message_ts = str(latest_message["ts"])
-                
-                # Verify this is our message by checking if it contains the @mention
-                if f"<@{self.BART_USER_ID}>" not in latest_message.get("text", ""):
-                    logger.warning(f":warning: [{request_id}] Latest message doesn't contain our @mention")
-                    logger.warning(f"   Message text: {latest_message.get('text', '')[:100]}")
-                
-                logger.info(f":white_check_mark: [{request_id}] Got message timestamp from history: {message_ts}")
-                
-                # Validate timestamp format (should be like "1234567890.123456")
-                if "." not in message_ts:
-                    logger.error(f":x: [{request_id}] Invalid timestamp format: {message_ts} (missing decimal point)")
-                    raise ValueError(f"Invalid timestamp format: {message_ts}")
-                
-                logger.info(f":white_check_mark: [{request_id}] Question posted with file attachment (ts: {message_ts})")
-                return message_ts
-                
-            except Exception as e:
-                logger.error(f":x: [{request_id}] Failed to upload file or get timestamp: {e}")
-                raise
+            file_result = await self.client.files_upload_v2(
+                channel=self.channel_id,
+                content=question,
+                filename=f"ticket_details_{request_id}.txt",
+                title=f"Ticket Details (Request {request_id})",
+                initial_comment=summary
+            )
+            
+            logger.info(f":white_check_mark: [{request_id}] File uploaded")
+            
+            await asyncio.sleep(0.5)
+            
+            history_response = await self.client.conversations_history(
+                channel=self.channel_id,
+                limit=1
+            )
+            
+            if not history_response.get("messages"):
+                raise ValueError("No messages in history")
+            
+            message_ts = str(history_response["messages"][0]["ts"])
+            logger.info(f":white_check_mark: [{request_id}] Got timestamp: {message_ts}")
+            
+            return message_ts
     
-    async def ask(self, question: str, ticket_id: int, request_id: str, timeout: Optional[float] = None) -> Dict[str, Any]:
-        """
-        Ask Bart a question by posting to channel with @mention.
-        
-        Args:
-            question: Question to ask Bart
-            ticket_id: Zendesk ticket ID (to prevent race conditions)
-            request_id: Unique request ID for logging
-            timeout: Optional timeout in seconds
-        
-        Returns:
-            dict: {
-                "response": str,
-                "ticket_id": int,
-                "slack_thread_url": str
-            }
-        """
-        # Check if this ticket was recently processed (deduplication)
-        if self.was_recently_processed(ticket_id):
+    async def ask(self, question: str, ticket_id: int, request_id: str, 
+                  timeout: Optional[float] = None, custom_ttl: Optional[float] = None) -> Dict[str, Any]:
+        """Ask Bart a question"""
+        if self.was_recently_processed(ticket_id, custom_ttl=custom_ttl):
             time_since = time.time() - self.processed_tickets[ticket_id]
             minutes_ago = int(time_since / 60)
-            raise ValueError(
-                f"Ticket {ticket_id} was already processed {minutes_ago} minute(s) ago. "
-                f"Skipping to prevent duplicate processing."
-            )
+            raise ValueError(f"Ticket {ticket_id} already processed {minutes_ago} min ago")
         
-        # Check if this ticket is already being processed
         if ticket_id in self.active_tickets:
-            raise ValueError(f"Ticket {ticket_id} is already being processed")
+            raise ValueError(f"Ticket {ticket_id} already being processed")
         
-        # Lock this ticket
         self.active_tickets.add(ticket_id)
-        logger.info(f":lock: [{request_id}] Locked ticket {ticket_id} for processing")
+        logger.info(f":lock: [{request_id}] Locked ticket {ticket_id}")
         
         try:
             if timeout is None:
                 timeout = self.default_timeout
             
-            # Post question as SINGLE message (or with file attachment if too long)
             message_ts = await self._post_question(question, request_id)
-            logger.info(f":mag: [{request_id}] Tracking responses in thread: {message_ts} (ticket_id: {ticket_id})")
+            logger.info(f":mag: [{request_id}] Tracking thread: {message_ts}")
             
-            # Setup response tracking with message collection AND ticket_id
             self.pending_responses[message_ts] = {
                 "messages": [],
                 "last_message_time": time.time(),
@@ -636,66 +411,19 @@ class BartClient:
                 "request_id": request_id
             }
             
-            # IMPORTANT: Check for any messages that already exist in the thread
-            # Bart might respond so quickly that messages arrive before we start tracking
             try:
-                logger.info(f":mag: [{request_id}] Checking for existing messages in thread...")
-                thread_history = await self.client.conversations_replies(
-                    channel=self.channel_id,
-                    ts=message_ts,
-                    limit=100
-                )
-                
-                # Collect any existing Bart messages (skip the first one, which is our question)
-                existing_messages = thread_history.get("messages", [])[1:]  # Skip our question
-                for msg in existing_messages:
-                    if msg.get("user") == self.BART_USER_ID:
-                        text = msg.get("text", "")
-                        ts = msg.get("ts")
-                        
-                        # Check if we already have this message (deduplication)
-                        already_collected = any(m["ts"] == ts for m in self.pending_responses[message_ts]["messages"])
-                        if already_collected:
-                            logger.info(f":repeat: [{request_id}] Skipping duplicate message (ts: {ts}) - already collected")
-                            continue
-                        
-                        is_working = self.is_working_message(text)
-                        is_final = self.is_final_message(text)
-                        
-                        self.pending_responses[message_ts]["messages"].append({
-                            "text": text,
-                            "ts": ts,
-                            "is_working": is_working,
-                            "is_final": is_final
-                        })
-                        logger.info(f":fast_forward: [{request_id}] Collected existing message (ts: {ts}, is_final={is_final}, length={len(text)})")
-                
-                if existing_messages:
-                    logger.info(f":white_check_mark: [{request_id}] Found {len([m for m in existing_messages if m.get('user') == self.BART_USER_ID])} existing Bart messages in thread")
-                else:
-                    logger.info(f":mag: [{request_id}] No existing messages found (thread is new)")
-                    
-            except Exception as e:
-                logger.warning(f":warning: [{request_id}] Failed to check existing thread messages: {e}")
-                logger.warning(f":warning: [{request_id}] Will rely on real-time message events (may miss early messages)")
-            
-            try:
-                # Wait for Bart to finish responding
                 await self._wait_for_completion(message_ts, timeout)
                 
-                # Get Slack thread permalink
+                # Get permalink
                 try:
                     permalink_response = await self.client.chat_getPermalink(
                         channel=self.channel_id,
                         message_ts=message_ts
                     )
                     thread_url = permalink_response.get("permalink", "")
-                    logger.info(f":link: [{request_id}] Slack thread URL: {thread_url}")
                 except Exception as e:
-                    logger.warning(f":warning: [{request_id}] Failed to get Slack permalink: {e}")
                     thread_url = ""
                 
-                # Concatenate all collected messages
                 complete_response = self.concatenate_messages(message_ts)
                 
                 return {
@@ -703,97 +431,74 @@ class BartClient:
                     "ticket_id": self.pending_responses[message_ts]["ticket_id"],
                     "slack_thread_url": thread_url
                 }
-            except TimeoutError:
-                raise
             finally:
-                # Cleanup pending response
                 self.pending_responses.pop(message_ts, None)
         finally:
-            # Always unlock the ticket and mark as processed
             self.active_tickets.discard(ticket_id)
             self.mark_as_processed(ticket_id)
             logger.info(f":unlock: [{request_id}] Unlocked ticket {ticket_id}")
 
 
 class ZendeskClient:
-    """Zendesk API client for updating tickets"""
+    """Zendesk API client"""
     
     def __init__(self, subdomain: str, email: str, token: str):
+        # IMPROVEMENT 5: Increased timeout to 120s
         self.zenpy_client = Zenpy(
             subdomain=subdomain,
             email=email,
             token=token,
-            timeout=120  # Increase timeout to 120 seconds (default is 60)
+            timeout=120
         )
     
     def add_comment(self, ticket_id: int, comment_text: str, public: bool = True):
-        """Add a comment to a Zendesk ticket"""
+        """Add comment to ticket"""
         try:
             ticket = self.zenpy_client.tickets(id=ticket_id)
             ticket.comment = Comment(body=comment_text, public=public)
             self.zenpy_client.tickets.update(ticket)
-            logger.info(f":white_check_mark: Added comment to Zendesk ticket #{ticket_id}")
+            logger.info(f":white_check_mark: Added comment to ticket #{ticket_id}")
         except Exception as e:
-            logger.error(f":x: Failed to update Zendesk ticket #{ticket_id}: {e}")
+            logger.error(f":x: Failed to update ticket #{ticket_id}: {e}")
             raise
     
     def get_ticket(self, ticket_id: int) -> Ticket:
-        """Get a Zendesk ticket by ID"""
+        """Get ticket by ID"""
         return self.zenpy_client.tickets(id=ticket_id)
     
     def get_organization(self, org_id: int):
-        """Get a Zendesk organization by ID"""
+        """Get organization by ID"""
         try:
             return self.zenpy_client.organizations(id=org_id)
         except Exception as e:
-            logger.warning(f":warning: Failed to get organization {org_id}: {e}")
+            logger.warning(f":warning: Failed to get org {org_id}: {e}")
             return None
     
     def has_recent_bart_comment(self, ticket_id: int, within_hours: int = 24) -> bool:
-        """
-        Check if Bart has already commented on this ticket recently.
-        
-        Args:
-            ticket_id: Zendesk ticket ID
-            within_hours: Consider comments within this many hours (default: 24)
-        
-        Returns:
-            True if Bart commented recently, False otherwise
-        """
+        """Check if Bart commented recently"""
         try:
-            from datetime import datetime, timedelta, timezone
-            
-            # Get ticket comments
             ticket = self.zenpy_client.tickets(id=ticket_id)
             comments = self.zenpy_client.tickets.comments(ticket=ticket)
             
-            # Calculate cutoff time
             cutoff_time = datetime.now(timezone.utc) - timedelta(hours=within_hours)
-            
-            # Check for Bart's signature in recent comments
             bart_signature = "This response was automatically generated by Bart"
             
             for comment in comments:
-                # Check if comment is recent
                 if comment.created_at and comment.created_at.replace(tzinfo=timezone.utc) > cutoff_time:
-                    # Check if this is a Bart comment
                     if comment.body and bart_signature in comment.body:
-                        logger.info(f":robot_face: Found recent Bart comment on ticket #{ticket_id} from {comment.created_at}")
                         return True
             
-            logger.info(f":mag: No recent Bart comments found on ticket #{ticket_id}")
             return False
-            
         except Exception as e:
-            logger.warning(f":warning: Failed to check comments on ticket #{ticket_id}: {e}")
-            # On error, assume no recent comment (allow processing)
+            logger.warning(f":warning: Failed to check comments: {e}")
             return False
 
 
 class ZendeskWebhookHandler:
-    """Handles Zendesk webhook events and integrates with Bart"""
+    """Handles Zendesk webhook events"""
     
-    def __init__(self, bart_client: BartClient, zendesk_client: ZendeskClient, webhook_secret: Optional[str] = None, bart_comment_check_hours: int = 24):
+    def __init__(self, bart_client: BartClient, zendesk_client: ZendeskClient, 
+                 webhook_secret: Optional[str] = None, bart_comment_check_hours: int = 24):
         self.bart = bart_client
         self.zendesk = zendesk_client
         self.webhook_secret = webhook_secret
@@ -802,16 +507,14 @@ class ZendeskWebhookHandler:
     @staticmethod
     def format_for_zendesk(text: str) -> str:
         """
-        Cleanup for Zendesk comments (supports Markdown).
-        Handles HTML entities, emoji codes, and ensures proper section breaks.
-        PRESERVES Markdown formatting since comments render it.
+        EMOJI DECODING: Clean up HTML entities and convert emoji codes
         """
         import html
         
-        # 1. Decode HTML entities
+        # Decode HTML entities
         text = html.unescape(text)
         
-        # 2. Convert Slack emoji codes to actual emojis
+        # Convert emoji codes
         emoji_map = {
             ':dart:': '🎯',
             ':books:': '📚',
@@ -827,42 +530,25 @@ class ZendeskWebhookHandler:
             ':x:': '❌',
             ':fire:': '🔥',
             ':robot_face:': '🤖',
+            ':speech_balloon:': '💬',
         }
         for code, emoji in emoji_map.items():
             text = text.replace(code, emoji)
         
-        # 3. Ensure proper section breaks for regression analysis
-        # Look for regression section markers and ensure clear delineation
-        regression_patterns = [
-            r'REGRESSION ANALYSIS',
-            r'Regression Analysis',
-            r'Regression analysis',
-        ]
-        
+        # Ensure proper section breaks before regression analysis
+        regression_patterns = ['REGRESSION ANALYSIS', 'Regression Analysis']
         for pattern in regression_patterns:
-            # Ensure there's a --- separator and proper spacing before regression section
-            # Pattern: text\n\n---\n\n**REGRESSION ANALYSIS**
             text = re.sub(
                 rf'([^\n])\s*\n+\**{pattern}\**',
                 rf'\1\n\n---\n\n**{pattern.upper()}**',
                 text
             )
-            # Also handle if there's already a --- but not enough spacing
-            text = re.sub(
-                rf'([^\n])\s*\n+---+\s*\n+\**{pattern}\**',
-                rf'\1\n\n---\n\n**{pattern.upper()}**',
-                text
-            )
-        
-        # 4. Keep Markdown formatting (bold, italic, code blocks)
-        # Comments support Markdown, so preserve all formatting
         
         return text
     
     def verify_signature(self, body: bytes, signature: str) -> bool:
-        """Verify Zendesk webhook signature"""
+        """Verify webhook signature"""
         if not self.webhook_secret:
-            logger.warning(":warning: No webhook secret configured - skipping signature verification")
             return True
         
         computed_signature = hmac.new(
@@ -874,55 +560,49 @@ class ZendeskWebhookHandler:
         return hmac.compare_digest(computed_signature, signature)
     
     def detect_deployment_type(self, tags: list) -> str:
-        """Detect deployment type from ticket tags"""
+        """Detect deployment from tags"""
         if "on_premise" in tags:
             return "on_premise"
         return "cloud"
     
     def build_question_from_ticket(self, ticket: Dict[str, Any], zendesk_subdomain: str) -> str:
-        """Build a complete question from ticket Subject and Description with prompt engineering"""
+        """
+        Build question with prompt engineering
+        IMPROVEMENT 2: Includes regression analysis instructions
+        """
         ticket_id = ticket.get("id", "unknown")
         subject = ticket.get("subject", "").strip()
         description = ticket.get("description", "").strip()
+        conversation = ticket.get("conversation", "").strip()
         tags = ticket.get("tags", [])
         organization_id = ticket.get("organization_id")
         
-        logger.info(f":label: Extracted {len(tags)} tags from ticket: {tags[:5]}{'...' if len(tags) > 5 else ''}")
-        logger.info(f":building_construction: Organization ID: {organization_id}")
-        
-        # Fetch organization name if available
+        # Fetch organization name
         organization_name = None
         if organization_id:
             try:
                 org = self.zendesk.get_organization(organization_id)
                 organization_name = org.name if org else None
-                if organization_name:
-                    logger.info(f":building_construction: Organization name: {organization_name}")
             except Exception as e:
-                logger.warning(f":warning: Failed to fetch organization {organization_id}: {e}")
+                logger.warning(f":warning: Failed to fetch org: {e}")
         
-        # Detect deployment type
         deployment_type = self.detect_deployment_type(tags)
-        logger.info(f":computer: Detected deployment type: {deployment_type}")
-        
-        # Build ticket URL
         ticket_url = f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
         
-        # Build the question with Subject and Description
+        # Build question
         question_parts = []
         if subject:
             question_parts.append(f"Subject: {subject}")
         if description:
             question_parts.append(f"*Description:*\n{description}")
-        
-        # Add company/customer name if available
+        if conversation:
+            question_parts.append(f"*Additional Comments / Conversation:*\n{conversation}")
         if organization_name:
             question_parts.append(f"\n*Company/Customer:* {organization_name}")
         
-        # Add deployment type context
         question_parts.append(f"Deployment Type: {deployment_type}")
         
-        # Add prompt engineering instructions with regression analysis
+        # IMPROVEMENT 2: Add regression analysis instructions
         additional_instructions = f"""
 ---
 Instructions for your response:
@@ -934,42 +614,38 @@ Instructions for your response:
 """
         question_parts.append(additional_instructions)
         
-        # Combine all parts
-        full_question = "\n\n".join(question_parts)
-        return full_question
+        return "\n\n".join(question_parts)
     
     def should_process_ticket(self, payload: Dict[str, Any]) -> bool:
-        """Determine if this ticket should be processed by Bart"""
+        """Determine if ticket should be processed"""
         ticket = payload.get("ticket", {})
         ticket_id = ticket.get("id")
-        status = ticket.get("status", "").lower()  # Convert to lowercase for comparison
+        status = ticket.get("status", "").lower()
         
         if status in ["closed", "solved"]:
-            logger.info(f":black_right_pointing_double_triangle_with_vertical_bar: Skipping ticket {ticket_id} - status is {status}")
+            logger.info(f":black_right_pointing_double_triangle_with_vertical_bar: Skipping {ticket_id} - status is {status}")
             return False
         
         tags = ticket.get("tags", [])
         if "bart-ignore" in tags:
-            logger.info(f":black_right_pointing_double_triangle_with_vertical_bar: Skipping ticket {ticket_id} - has 'bart-ignore' tag")
+            logger.info(f":black_right_pointing_double_triangle_with_vertical_bar: Skipping {ticket_id} - has bart-ignore")
             return False
         
         subject = ticket.get("subject", "").strip()
         description = ticket.get("description", "").strip()
         if not subject and not description:
-            logger.info(f":black_right_pointing_double_triangle_with_vertical_bar: Skipping ticket {ticket_id} - no subject or description")
+            logger.info(f":black_right_pointing_double_triangle_with_vertical_bar: Skipping {ticket_id} - no content")
             return False
         
-        # Check if Bart already commented on this ticket recently
-        # This prevents reprocessing tickets after app restart when webhooks are retried
         if self.zendesk.has_recent_bart_comment(ticket_id, within_hours=self.bart_comment_check_hours):
-            logger.info(f":black_right_pointing_double_triangle_with_vertical_bar: Skipping ticket {ticket_id} - Bart already commented within last {self.bart_comment_check_hours} hours")
+            logger.info(f":black_right_pointing_double_triangle_with_vertical_bar: Skipping {ticket_id} - recent comment")
             return False
         
         return True
     
-    async def process_ticket_event(self, payload: Dict[str, Any], zendesk_subdomain: str) -> Dict[str, Any]:
-        """Process a Zendesk ticket create/update event"""
-        # Generate unique request ID for tracking
+    async def process_ticket_event(self, payload: Dict[str, Any], zendesk_subdomain: str, 
+                                   add_comment: bool = True, is_test_request: bool = False) -> Dict[str, Any]:
+        """Process ticket event"""
         request_id = str(uuid.uuid4())[:8]
         
         ticket = payload.get("ticket", {})
@@ -979,69 +655,34 @@ Instructions for your response:
         logger.info(f"")
         logger.info(f"{'='*80}")
         logger.info(f":inbox_tray: [{request_id}] PROCESSING TICKET #{ticket_id}")
-        logger.info(f":inbox_tray: [{request_id}] Event Type: {event_type}")
-        logger.info(f":inbox_tray: [{request_id}] Ticket Status: {ticket.get('status', 'unknown')}")
-        logger.info(f":inbox_tray: [{request_id}] Subject: {ticket.get('subject', 'N/A')[:80]}")
+        logger.info(f":inbox_tray: [{request_id}] Event: {event_type}")
         
-        # Log processing history status
-        if self.bart.was_recently_processed(ticket_id):
-            time_since = time.time() - self.bart.processed_tickets[ticket_id]
-            minutes_ago = int(time_since / 60)
-            logger.info(f":clock1: [{request_id}] Processing history: Last processed {minutes_ago} minute(s) ago")
-        else:
-            logger.info(f":new: [{request_id}] Processing history: Not recently processed")
+        ttl_to_use = self.bart.test_processing_ttl if is_test_request else None
         
-        # Check if this ticket is already being processed (race condition check)
         if ticket_id in self.bart.active_tickets:
-            logger.warning(f":warning: [{request_id}] Ticket #{ticket_id} is already being processed, skipping")
-            return {
-                "status": "skipped",
-                "ticket_id": ticket_id,
-                "reason": "Ticket is already being processed by another job"
-            }
+            logger.warning(f":warning: Ticket #{ticket_id} already being processed")
+            return {"status": "skipped", "ticket_id": ticket_id}
         
-        # Check if we should process this ticket
         if not self.should_process_ticket(payload):
-            return {
-                "status": "skipped",
-                "ticket_id": ticket_id,
-                "reason": "Ticket does not meet processing criteria"
-            }
+            return {"status": "skipped", "ticket_id": ticket_id}
         
-        # Build question from ticket
         question = self.build_question_from_ticket(ticket, zendesk_subdomain)
-        
-        # Detect deployment type for logging
         deployment_type = self.detect_deployment_type(ticket.get("tags", []))
         
-        logger.info(f":thinking_face: [{request_id}] Built question for ticket #{ticket_id} (deployment: {deployment_type})")
-        logger.info(f"   Question preview: {question[:200]}...")
-        
         try:
-            # Ask Bart (with unique request_id for tracking)
-            logger.info(f":robot_face: [{request_id}] Asking Bart about ticket #{ticket_id}...")
+            logger.info(f":robot_face: [{request_id}] Asking Bart...")
             start_time = time.time()
             
-            result = await self.bart.ask(question, ticket_id=ticket_id, request_id=request_id)
+            result = await self.bart.ask(question, ticket_id=ticket_id, request_id=request_id, custom_ttl=ttl_to_use)
             bart_response = result["response"]
-            response_ticket_id = result["ticket_id"]
             slack_thread_url = result.get("slack_thread_url", "")
             
-            # Verify we got the right ticket_id back
-            if response_ticket_id != ticket_id:
-                logger.error(f":x: [{request_id}] RACE CONDITION DETECTED! Expected ticket #{ticket_id}, got #{response_ticket_id}")
-                ticket_id = response_ticket_id
-            
             elapsed = time.time() - start_time
-            logger.info(f":white_check_mark: [{request_id}] Bart finished responding in {elapsed:.1f} seconds")
-            logger.info(f"   Response length: {len(bart_response)} characters")
+            logger.info(f":white_check_mark: [{request_id}] Bart responded in {elapsed:.1f}s")
             
-            # Clean up formatting for Zendesk (HTML entities, emoji codes)
-            logger.info(f":art: [{request_id}] Formatting response for Zendesk...")
+            # EMOJI DECODING: Apply formatting cleanup
             cleaned_response = self.format_for_zendesk(bart_response)
-            logger.info(f":art: [{request_id}] Formatting complete")
             
-            # Format response for Zendesk with Slack thread link
             formatted_response = (
                 f"🤖 **Bart's Response:**\n\n"
                 f"{cleaned_response}\n\n"
@@ -1050,90 +691,111 @@ Instructions for your response:
                 f"Response generated at {datetime.now(timezone.utc).isoformat()}Z_"
             )
             
-            # Add Slack thread link if available
             if slack_thread_url:
                 formatted_response += f"\n\n💬 [View conversation in Slack]({slack_thread_url})"
             
-            # Update Zendesk ticket with Bart's response (private comment)
-            self.zendesk.add_comment(
-                ticket_id=response_ticket_id,
-                comment_text=formatted_response,
-                public=False
-            )
+            if add_comment:
+                self.zendesk.add_comment(ticket_id=ticket_id, comment_text=formatted_response, public=False)
             
-            logger.info(f":white_check_mark: [{request_id}] Successfully processed ticket #{ticket_id}")
+            logger.info(f":white_check_mark: [{request_id}] Successfully processed #{ticket_id}")
             logger.info(f"{'='*80}")
-            logger.info(f"")
             
             return {
                 "status": "success",
                 "ticket_id": ticket_id,
                 "deployment_type": deployment_type,
                 "response_length": len(bart_response),
-                "processing_time_seconds": elapsed
+                "processing_time_seconds": elapsed,
+                "response": bart_response,
+                "formatted_response": formatted_response,
+                "slack_thread_url": slack_thread_url,
+                "comment_added": add_comment
             }
         
         except ValueError as e:
-            # Ticket already being processed or recently processed (deduplication)
-            error_msg = str(e)
-            logger.warning(f":warning: [{request_id}] {error_msg}")
-            
-            # Don't add comment to Zendesk for recently processed tickets (avoid spam)
-            if "already processed" in error_msg and "minute(s) ago" in error_msg:
-                logger.info(f":no_entry: [{request_id}] Skipping Zendesk comment for duplicate request")
-            
-            return {
-                "status": "skipped",
-                "ticket_id": ticket_id,
-                "reason": error_msg
-            }
+            logger.warning(f":warning: [{request_id}] {str(e)}")
+            return {"status": "skipped", "ticket_id": ticket_id, "reason": str(e)}
         
         except TimeoutError as e:
-            logger.error(f":alarm_clock: [{request_id}] Timeout processing ticket #{ticket_id}: {e}")
-            timeout_minutes = self.bart.default_timeout / 60
-            self.zendesk.add_comment(
-                ticket_id=ticket_id,
-                comment_text=(
-                    f":alarm_clock: Bart took too long to respond (timeout after {timeout_minutes:.0f} minutes). "
-                    f"This might be a complex question. Please try asking again or reach out to support."
-                ),
-                public=False
-            )
-            return {
-                "status": "timeout",
-                "ticket_id": ticket_id,
-                "error": str(e)
-            }
+            logger.error(f":alarm_clock: [{request_id}] Timeout: {e}")
+            if add_comment:
+                self.zendesk.add_comment(
+                    ticket_id=ticket_id,
+                    comment_text=":alarm_clock: Bart took too long. Please try again.",
+                    public=False
+                )
+            return {"status": "timeout", "ticket_id": ticket_id, "error": str(e)}
         
         except Exception as e:
-            logger.error(f":x: [{request_id}] Error processing ticket #{ticket_id}: {e}")
-            self.zendesk.add_comment(
-                ticket_id=ticket_id,
-                comment_text=(
-                    f":x: Bart encountered an error while processing your question: {str(e)}\n"
-                    f"A human agent will follow up shortly."
-                ),
-                public=False
-            )
-            return {
-                "status": "error",
-                "ticket_id": ticket_id,
-                "error": str(e)
-            }
+            logger.error(f":x: [{request_id}] Error: {e}")
+            if add_comment:
+                self.zendesk.add_comment(
+                    ticket_id=ticket_id,
+                    comment_text=f":x: Bart error: {str(e)}",
+                    public=False
+                )
+            return {"status": "error", "ticket_id": ticket_id, "error": str(e)}
 
 
-# Initialize FastAPI app
+# FastAPI app
 app = FastAPI(title="Bart Zendesk Webhook Handler")
 
-# Global clients (initialized on startup)
+# Global clients
 bart_client: Optional[BartClient] = None
 zendesk_client: Optional[ZendeskClient] = None
 webhook_handler: Optional[ZendeskWebhookHandler] = None
 zendesk_subdomain: Optional[str] = None
 
+# JOB TRACKING for async processing
+jobs: Dict[str, Dict[str, Any]] = {}
+JOB_TTL = 3600
+
+
+def cleanup_old_jobs():
+    """Remove completed jobs older than JOB_TTL"""
+    current_time = time.time()
+    expired = [
+        jid for jid, job in jobs.items()
+        if job.get("status") in ["complete", "error", "skipped"] 
+        and current_time - job.get("completed_at", current_time) > JOB_TTL
+    ]
+    for jid in expired:
+        jobs.pop(jid, None)
+
+
+def create_job(ticket_id: int, payload: Dict[str, Any]) -> str:
+    """Create job and return job_id"""
+    job_id = str(uuid.uuid4())
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "processing",
+        "ticket_id": ticket_id,
+        "created_at": time.time(),
+        "payload": payload
+    }
+    logger.info(f":id: Created job {job_id} for ticket #{ticket_id}")
+    cleanup_old_jobs()
+    return job_id
+
+
+def update_job(job_id: str, status: str, result: Dict[str, Any]):
+    """Update job with result"""
+    if job_id in jobs:
+        jobs[job_id].update({
+            "status": status,
+            "result": result,
+            "completed_at": time.time()
+        })
+        logger.info(f":white_check_mark: Job {job_id} - status: {status}")
+
+
+def get_job(job_id: str) -> Optional[Dict[str, Any]]:
+    """Get job"""
+    return jobs.get(job_id)
+
 
 async def resolve_channel_id(client: AsyncWebClient, channel_name_or_id: str) -> str:
-    """Resolve a channel name to its ID"""
+    """Resolve channel name to ID"""
     if channel_name_or_id.startswith("C"):
         return channel_name_or_id
     
@@ -1143,20 +805,18 @@ async def resolve_channel_id(client: AsyncWebClient, channel_name_or_id: str) ->
         response = await client.conversations_list(types="public_channel,private_channel")
         for channel in response["channels"]:
             if channel["name"] == channel_name:
-                logger.info(f":white_check_mark: Resolved channel '{channel_name}' to ID: {channel['id']}")
                 return channel["id"]
         raise ValueError(f"Channel '{channel_name}' not found")
     except Exception as e:
-        logger.error(f":x: Failed to resolve channel name '{channel_name}': {e}")
+        logger.error(f":x: Failed to resolve channel: {e}")
         raise
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize clients on startup"""
+    """Initialize clients"""
     global bart_client, zendesk_client, webhook_handler, zendesk_subdomain
     
-    # Load configuration
     bot_token = os.getenv("SLACK_BOT_TOKEN")
     app_token = os.getenv("SLACK_APP_TOKEN")
     channel_id = os.getenv("SLACK_CHANNEL_ID")
@@ -1169,27 +829,20 @@ async def startup_event():
     bart_timeout = float(os.getenv("BART_TIMEOUT", "600"))
     bart_completion_wait = float(os.getenv("BART_COMPLETION_WAIT", "120"))
     bart_fallback_wait = float(os.getenv("BART_FALLBACK_WAIT", "540"))
-    processing_history_ttl = float(os.getenv("PROCESSING_HISTORY_TTL", "3600"))  # 1 hour default
-    bart_comment_check_hours = int(os.getenv("BART_COMMENT_CHECK_HOURS", "24"))  # 24 hours default
+    processing_history_ttl = float(os.getenv("PROCESSING_HISTORY_TTL", "3600"))
+    test_processing_ttl = float(os.getenv("TEST_PROCESSING_TTL", "300"))
+    bart_comment_check_hours = int(os.getenv("BART_COMMENT_CHECK_HOURS", "24"))
     
     if not all([bot_token, app_token, zendesk_subdomain, zendesk_email, zendesk_token]):
-        raise ValueError(
-            "Missing required environment variables:\n"
-            "  SLACK_BOT_TOKEN, SLACK_APP_TOKEN, ZENDESK_SUBDOMAIN, ZENDESK_EMAIL, ZENDESK_API_TOKEN"
-        )
+        raise ValueError("Missing required environment variables")
     
     if not channel_id and not channel_name:
-        raise ValueError(
-            "Missing required environment variable:\n"
-            "  SLACK_CHANNEL_ID or SLACK_CHANNEL_NAME must be set"
-        )
+        raise ValueError("Missing channel configuration")
     
-    # Resolve channel ID if channel name was provided
     if not channel_id:
         client = AsyncWebClient(token=bot_token)
         channel_id = await resolve_channel_id(client, channel_name)
     
-    # Initialize clients
     bart_client = BartClient(
         bot_token=bot_token,
         app_token=app_token,
@@ -1199,13 +852,15 @@ async def startup_event():
         fallback_wait=bart_fallback_wait
     )
     
-    # Set custom processing history TTL if specified
     bart_client.processing_history_ttl = processing_history_ttl
+    bart_client.test_processing_ttl = test_processing_ttl
+    
     zendesk_client = ZendeskClient(
         subdomain=zendesk_subdomain,
         email=zendesk_email,
         token=zendesk_token
     )
+    
     webhook_handler = ZendeskWebhookHandler(
         bart_client=bart_client,
         zendesk_client=zendesk_client,
@@ -1213,267 +868,209 @@ async def startup_event():
         bart_comment_check_hours=bart_comment_check_hours
     )
     
-    # Connect Bart to Slack
     await bart_client.connect()
     
-    # Display server URLs
     port = int(os.getenv("PORT", "8000"))
-    logger.info(":rocket: Bart Zendesk Webhook Handler started successfully")
-    logger.info("=" * 80)
-    logger.info(":satellite_antenna: Server listening on:")
-    logger.info(f"   Local:   http://localhost:{port}")
-    if public_url:
-        logger.info(f"   Public:  {public_url}")
-    else:
-        logger.info(f"   Network: http://0.0.0.0:{port}")
-        logger.warning("   :warning:  PUBLIC_URL not set - configure for production deployment")
-    logger.info("")
-    
     base_url = public_url if public_url else f"http://localhost:{port}"
-    logger.info(":mailbox_with_mail: Endpoints:")
-    logger.info(f"   Health Check:       GET  {base_url}/")
-    logger.info(f"   Zendesk Webhook:    POST {base_url}/zendesk/webhook")
-    logger.info(f"   Get Ticket:         GET  {base_url}/zendesk/ticket/{{ticket_id}}")
-    logger.info(f"   Test Endpoint:      POST {base_url}/zendesk/test")
+    
+    logger.info(":rocket: Bart Zendesk Webhook Handler - MERGED VERSION")
+    logger.info("=" * 80)
+    logger.info(f"   Health:     GET  {base_url}/")
+    logger.info(f"   Webhook:    POST {base_url}/zendesk/webhook")
+    logger.info(f"   Get Ticket: GET  {base_url}/zendesk/ticket/{{ticket_id}}")
+    logger.info(f"   Test:       POST {base_url}/zendesk/test")
+    logger.info(f"   Job Status: GET  {base_url}/zendesk/job/{{job_id}}")
     logger.info("")
-    logger.info(f":stopwatch:  Bart timeout: {bart_timeout:.0f} seconds ({bart_timeout/60:.1f} minutes)")
-    logger.info(f":stopwatch:  Bart completion wait: {bart_completion_wait:.0f} seconds ({bart_completion_wait/60:.1f} minutes)")
-    logger.info(f":stopwatch:  Bart fallback wait: {bart_fallback_wait:.0f} seconds ({bart_fallback_wait/60:.1f} minutes)")
-    logger.info(f":shield:  Processing history TTL: {processing_history_ttl:.0f} seconds ({processing_history_ttl/60:.1f} minutes)")
-    logger.info(f":speech_balloon:  Bart comment check window: {bart_comment_check_hours} hours")
+    logger.info(f"   Features: Job tracking, Block extraction, Regression analysis, Emoji decoding")
     logger.info("=" * 80)
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Cleanup on shutdown"""
+    """Cleanup"""
     if bart_client:
         await bart_client.disconnect()
-    logger.info(":wave: Bart Zendesk Webhook Handler shut down")
 
 
 @app.get("/")
 async def health_check():
-    """Health check endpoint"""
+    """Health check"""
     return {
         "status": "healthy",
-        "service": "Bart Zendesk Webhook Handler",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "service": "Bart Zendesk Webhook Handler - Merged Version",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "features": ["job_tracking", "block_extraction", "regression_analysis", "emoji_decoding"]
     }
 
 
-@app.get("/info")
-async def service_info():
-    """Service information and configuration"""
-    return {
-        "service": "Bart Zendesk Webhook Handler",
-        "version": "1.0.0",
-        "description": "Provides technical solutions and code archaeology for DataHub support tickets",
-        "bot": {
-            "name": "Bart Bot",
-            "user_id": "U09RYUJDUQL",
-            "channel_id": bart_client.channel_id if bart_client else None,
-            "focus": "Technical solutions and code archaeology"
-        },
-        "configuration": {
-            "timeout": bart_client.default_timeout if bart_client else None,
-            "completion_wait": bart_client.completion_wait if bart_client else None,
-            "fallback_wait": bart_client.fallback_wait if bart_client else None,
-            "processing_history_ttl": bart_client.processing_history_ttl if bart_client else None,
-        },
-        "zendesk": {
-            "subdomain": zendesk_subdomain,
-            "output_location": "Private comment"
-        },
-        "endpoints": {
-            "health": "GET /",
-            "info": "GET /info",
-            "webhook": "POST /zendesk/webhook",
-            "get_ticket": "GET /zendesk/ticket/{ticket_id}",
-            "test": "POST /zendesk/test",
-            "docs": "GET /docs (interactive API documentation)",
-            "openapi": "GET /openapi.json (API schema)"
-        },
-        "features": [
-            "Technical solutions",
-            "Code archaeology",
-            "DataHub expertise",
-            "Restart-safe deduplication",
-            "Large ticket file attachment support",
-            "Private comment posting",
-            "Slack thread linking",
-            "Working message filtering"
-        ],
-        "status": {
-            "connected": bart_client.handler is not None if bart_client else False,
-            "active_tickets": len(bart_client.active_tickets) if bart_client else 0,
-            "processed_tickets_history": len(bart_client.processed_tickets) if bart_client else 0
+@app.get("/zendesk/job/{job_id}")
+async def get_job_status(job_id: str):
+    """
+    Poll job status - keeps connection alive with progress updates
+    
+    Returns "Bart is still processing..." messages
+    """
+    cleanup_old_jobs()
+    
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+    
+    job_status = job.get("status")
+    ticket_id = job.get("ticket_id")
+    created_at = job.get("created_at")
+    elapsed = int(time.time() - created_at)
+    
+    if job_status == "processing":
+        return {
+            "job_id": job_id,
+            "status": "processing",
+            "ticket_id": ticket_id,
+            "elapsed_seconds": elapsed,
+            "created_at": datetime.fromtimestamp(created_at, tz=timezone.utc).isoformat(),
+            "message": f"Bart is still processing... ({elapsed}s elapsed)"
         }
-    }
+    
+    elif job_status in ["complete", "error", "skipped"]:
+        result = job.get("result", {})
+        completed_at = job.get("completed_at", created_at)
+        
+        return {
+            "job_id": job_id,
+            "status": job_status,
+            "ticket_id": ticket_id,
+            "elapsed_seconds": int(completed_at - created_at),
+            "created_at": datetime.fromtimestamp(created_at, tz=timezone.utc).isoformat(),
+            "completed_at": datetime.fromtimestamp(completed_at, tz=timezone.utc).isoformat(),
+            "result": result
+        }
+    
+    return {"job_id": job_id, "status": "unknown"}
 
 
 @app.post("/zendesk/webhook")
 async def zendesk_webhook(request: Request, background_tasks: BackgroundTasks):
-    """Zendesk webhook endpoint"""
+    """
+    Zendesk webhook endpoint
+    
+    Supports async_mode for job tracking:
+    - async_mode=false (default): Background processing
+    - async_mode=true: Returns job_id, poll /zendesk/job/{job_id}
+    
+    Parameters:
+    - add_comment: Whether to post comment to Zendesk (default: true)
+    - force_reprocess: Bypass deduplication (default: false)
+    - async_mode: Enable job tracking (default: false)
+    """
     body = await request.body()
     signature = request.headers.get("X-Zendesk-Webhook-Signature", "")
     
     if webhook_handler.webhook_secret and not webhook_handler.verify_signature(body, signature):
-        logger.warning(":warning: Invalid webhook signature")
-        raise HTTPException(status_code=403, detail="Invalid webhook signature")
+        raise HTTPException(status_code=403, detail="Invalid signature")
     
     try:
         payload = await request.json()
     except Exception as e:
-        logger.error(f":x: Failed to parse webhook payload: {e}")
-        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+        raise HTTPException(status_code=400, detail="Invalid JSON")
     
-    # Log the raw payload structure for debugging
-    logger.info(f":mag: Raw webhook payload keys: {list(payload.keys())}")
+    add_comment = payload.get("add_comment", True)
+    force_reprocess = payload.get("force_reprocess", False)
+    async_mode = payload.get("async_mode", False)
     
-    # Extract event type from Zendesk's actual structure
-    # Format: "zen:event-type:ticket.created" or "zen:event-type:ticket.updated"
-    event_type_raw = payload.get("type", "unknown")
-    if event_type_raw.startswith("zen:event-type:"):
-        event_type = event_type_raw.replace("zen:event-type:", "")
-    else:
-        event_type = event_type_raw
-    
-    # Extract ticket data from 'detail' field (Zendesk's actual structure)
+    # Extract from Zendesk format
     ticket_detail = payload.get("detail", {})
-    
     if not ticket_detail:
-        logger.error(f":x: No 'detail' field found in webhook payload")
-        logger.error(f"   Available keys: {list(payload.keys())}")
-        raise HTTPException(status_code=400, detail="Missing 'detail' field in webhook payload")
+        raise HTTPException(status_code=400, detail="Missing 'detail' field")
     
-    # Extract ticket ID (may be string or int)
     ticket_id_raw = ticket_detail.get("id")
-    if not ticket_id_raw:
-        logger.error(f":x: No ticket ID found in detail field")
-        raise HTTPException(status_code=400, detail="Missing ticket ID in webhook payload")
+    ticket_id = int(ticket_id_raw) if isinstance(ticket_id_raw, str) else ticket_id_raw
     
-    # Convert to int if it's a string
-    try:
-        ticket_id = int(ticket_id_raw) if isinstance(ticket_id_raw, str) else ticket_id_raw
-    except (ValueError, TypeError):
-        logger.error(f":x: Invalid ticket ID format: {ticket_id_raw}")
-        raise HTTPException(status_code=400, detail=f"Invalid ticket ID: {ticket_id_raw}")
-    
-    ticket_status = ticket_detail.get("status", "unknown")
-    ticket_subject = ticket_detail.get("subject", "")
-    
-    logger.info(f":mailbox_with_mail: ===== WEBHOOK RECEIVED =====")
-    logger.info(f":mailbox_with_mail: Event Type: {event_type}")
-    logger.info(f":mailbox_with_mail: Ticket ID: {ticket_id}")
-    logger.info(f":mailbox_with_mail: Ticket Status: {ticket_status}")
-    logger.info(f":mailbox_with_mail: Subject: {ticket_subject[:80]}")
-    logger.info(f":mailbox_with_mail: Trigger: Zendesk webhook")
-    
-    # Check if ticket was recently processed
-    if bart_client.was_recently_processed(ticket_id):
+    # Check deduplication
+    if not force_reprocess and bart_client.was_recently_processed(ticket_id):
         time_since = time.time() - bart_client.processed_tickets[ticket_id]
         minutes_ago = int(time_since / 60)
-        logger.warning(f":warning: DUPLICATE WEBHOOK - Ticket #{ticket_id} was already processed {minutes_ago} minute(s) ago")
-        logger.warning(f":no_entry: Rejecting webhook to prevent duplicate processing")
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "rejected",
-                "reason": f"Ticket already processed {minutes_ago} minute(s) ago",
-                "ticket_id": ticket_id
-            }
-        )
+        return JSONResponse(status_code=200, content={
+            "status": "rejected",
+            "reason": f"Already processed {minutes_ago} min ago",
+            "ticket_id": ticket_id
+        })
     
-    logger.info(f":white_check_mark: Webhook accepted, queuing for processing")
-    
-    # Fetch fresh ticket data from Zendesk to ensure current status
-    # Webhooks can send stale data or be triggered at the wrong time
+    # Fetch fresh data
     try:
-        logger.info(f":mag: Fetching current ticket data from Zendesk for ticket #{ticket_id}")
         fresh_ticket = zendesk_client.get_ticket(ticket_id)
+        conversation = ticket_detail.get("conversation", "")
         
-        # Use fresh data from Zendesk, not webhook payload
         normalized_payload = {
-            "event_type": event_type,
+            "event_type": payload.get("type", "unknown").replace("zen:event-type:", ""),
             "ticket": {
                 "id": fresh_ticket.id,
                 "status": fresh_ticket.status,
                 "subject": fresh_ticket.subject,
                 "description": fresh_ticket.description,
+                "conversation": conversation,
                 "tags": fresh_ticket.tags,
                 "organization_id": fresh_ticket.organization_id
             }
         }
-        logger.info(f":white_check_mark: Fetched fresh ticket data - Current status: {fresh_ticket.status}")
     except Exception as e:
-        logger.error(f":x: Failed to fetch fresh ticket data from Zendesk: {e}")
-        logger.warning(f":warning: Falling back to webhook payload data")
+        logger.error(f":x: Failed to fetch ticket: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+    # ASYNC MODE: Job tracking
+    if async_mode:
+        job_id = create_job(ticket_id, normalized_payload)
         
-        # Fallback to webhook payload if Zendesk fetch fails
-        org_id_raw = ticket_detail.get("organization_id")
-        org_id = None
-        if org_id_raw:
+        async def process_with_job():
             try:
-                org_id = int(org_id_raw) if isinstance(org_id_raw, str) else org_id_raw
-            except (ValueError, TypeError):
-                logger.warning(f":warning: Invalid organization_id format: {org_id_raw}, setting to None")
-                org_id = None
+                result = await webhook_handler.process_ticket_event(
+                    normalized_payload, zendesk_subdomain, add_comment=add_comment
+                )
+                status = "complete" if result["status"] == "success" else result["status"]
+                update_job(job_id, status, result)
+            except Exception as e:
+                update_job(job_id, "error", {"error": str(e), "ticket_id": ticket_id})
         
-        normalized_payload = {
-            "event_type": event_type,
-            "ticket": {
-                "id": ticket_id,
-                "status": ticket_detail.get("status"),
-                "subject": ticket_detail.get("subject"),
-                "description": ticket_detail.get("description"),
-                "tags": ticket_detail.get("tags", []),
-                "organization_id": org_id
-            }
-        }
-    
-    # Wrapper to catch background task errors
-    async def safe_process_ticket():
-        try:
-            await webhook_handler.process_ticket_event(normalized_payload, zendesk_subdomain)
-        except Exception as e:
-            logger.error(f":x: Background task error processing ticket #{ticket_id}: {e}")
-            logger.exception("Full traceback:")
-    
-    background_tasks.add_task(safe_process_ticket)
-    
-    return JSONResponse(
-        status_code=200,
-        content={
+        background_tasks.add_task(process_with_job)
+        
+        return JSONResponse(status_code=202, content={
             "status": "accepted",
-            "message": f"Ticket #{ticket_id} queued for processing"
-        }
-    )
+            "job_id": job_id,
+            "ticket_id": ticket_id,
+            "poll_url": f"/zendesk/job/{job_id}",
+            "message": f"Poll /zendesk/job/{job_id} for status"
+        })
+    
+    # SYNC MODE: Background processing
+    async def process_ticket():
+        try:
+            await webhook_handler.process_ticket_event(normalized_payload, zendesk_subdomain, add_comment=add_comment)
+        except Exception as e:
+            logger.error(f":x: Background error: {e}")
+    
+    background_tasks.add_task(process_ticket)
+    
+    return JSONResponse(status_code=200, content={"status": "accepted", "ticket_id": ticket_id})
 
 
 @app.get("/zendesk/ticket/{ticket_id}")
-async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks):
-    """GET endpoint to process a Zendesk ticket by ID"""
+async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks, 
+                             add_comment: bool = True, force_reprocess: bool = False):
+    """
+    Process ticket by ID
+    
+    Parameters:
+    - add_comment: Post comment to Zendesk (default: true)
+    - force_reprocess: Bypass deduplication (default: false)
+    """
     try:
-        logger.info(f":inbox_tray: ===== GET REQUEST RECEIVED =====")
-        logger.info(f":inbox_tray: Ticket ID: {ticket_id}")
-        logger.info(f":inbox_tray: Trigger: HTTP GET request")
-        logger.info(f":inbox_tray: Fetching Zendesk ticket #{ticket_id}")
-        
-        # Check if ticket was recently processed
-        if bart_client.was_recently_processed(ticket_id):
+        if not force_reprocess and bart_client.was_recently_processed(ticket_id):
             time_since = time.time() - bart_client.processed_tickets[ticket_id]
             minutes_ago = int(time_since / 60)
-            logger.warning(f":warning: DUPLICATE REQUEST - Ticket #{ticket_id} was already processed {minutes_ago} minute(s) ago")
-            return JSONResponse(
-                status_code=200,
-                content={
-                    "status": "skipped",
-                    "reason": f"Ticket already processed {minutes_ago} minute(s) ago",
-                    "ticket_id": ticket_id,
-                    "message": f"Ticket #{ticket_id} was recently processed. Wait {60 - minutes_ago} more minute(s) or restart app to reprocess."
-                }
-            )
+            return JSONResponse(status_code=200, content={
+                "status": "skipped",
+                "reason": f"Already processed {minutes_ago} min ago",
+                "ticket_id": ticket_id
+            })
         
         ticket = zendesk_client.get_ticket(ticket_id)
         
@@ -1483,135 +1080,180 @@ async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks):
                 "id": ticket.id,
                 "subject": ticket.subject,
                 "description": ticket.description,
+                "conversation": "",
                 "tags": ticket.tags,
                 "status": ticket.status,
                 "organization_id": ticket.organization_id
             }
         }
         
-        logger.info(f":white_check_mark: Fetched ticket #{ticket_id}: {ticket.subject}")
-        logger.info(f":white_check_mark: GET request accepted, queuing for processing")
-        
         background_tasks.add_task(
             webhook_handler.process_ticket_event,
             payload,
-            zendesk_subdomain
+            zendesk_subdomain,
+            add_comment
         )
         
-        return JSONResponse(
-            status_code=200,
-            content={
-                "status": "accepted",
-                "ticket_id": ticket_id,
-                "message": f"Ticket #{ticket_id} queued for processing with Bart"
-            }
-        )
+        return JSONResponse(status_code=200, content={"status": "accepted", "ticket_id": ticket_id})
     except Exception as e:
-        logger.error(f":x: Failed to fetch ticket #{ticket_id}: {e}")
-        raise HTTPException(status_code=404, detail=f"Ticket #{ticket_id} not found or error: {str(e)}")
+        raise HTTPException(status_code=404, detail=str(e))
 
 
 @app.post("/zendesk/test")
-async def test_bart_question(request: Request):
-    """Test endpoint for asking Bart questions directly - handles both simple and webhook formats"""
+async def test_bart_question(request: Request, background_tasks: BackgroundTasks):
+    """
+    Test endpoint
+    
+    Supports async_mode for job tracking:
+    - async_mode=false (default): Synchronous, waits for response
+    - async_mode=true: Returns job_id, poll /zendesk/job/{job_id}
+    
+    Parameters:
+    - add_comment: Post to Zendesk (default: true)
+    - force_reprocess: Bypass deduplication (default: false)
+    - async_mode: Enable job tracking (default: false)
+    """
     try:
         data = await request.json()
         
-        # Check if this is a Zendesk webhook format (has 'detail' field)
+        # Handle webhook format
         if "detail" in data:
-            # Zendesk webhook format
-            logger.info(":test_tube: Detected Zendesk webhook format in test endpoint")
-            ticket_detail = data.get("detail", {})
-            
-            # Extract ticket ID
-            ticket_id_raw = ticket_detail.get("id")
-            ticket_id = int(ticket_id_raw) if ticket_id_raw else None
-            
-            subject = ticket_detail.get("subject", "")
-            description = ticket_detail.get("description", "")
-            tags = ticket_detail.get("tags", [])
-            org_id_raw = ticket_detail.get("organization_id")
-            org_id = int(org_id_raw) if org_id_raw else None
+            detail = data["detail"]
+            ticket_id = int(detail.get("id")) if detail.get("id") else None
+            subject = detail.get("subject", "")
+            description = detail.get("description", "")
+            conversation = detail.get("conversation", "")
+            tags = detail.get("tags", [])
         else:
-            # Simple test format
-            logger.info(":test_tube: Using simple test payload format")
+            # Simple format
             subject = data.get("subject", "")
             description = data.get("description", "")
+            conversation = data.get("conversation", "")
             ticket_id = data.get("ticket_id")
             tags = data.get("tags", [])
-            org_id = None
+        
+        add_comment = data.get("add_comment", True)
+        force_reprocess = data.get("force_reprocess", False)
+        async_mode = data.get("async_mode", False)
         
         if not subject and not description:
-            raise HTTPException(status_code=400, detail="Missing 'subject' or 'description' field")
+            raise HTTPException(status_code=400, detail="Missing subject or description")
         
-        logger.info(f":test_tube: Test request extracted:")
-        logger.info(f"   Ticket ID: {ticket_id}")
-        logger.info(f"   Subject: {subject[:100] if subject else '(empty)'}")
-        logger.info(f"   Description: {description[:100] if description else '(empty)'}...")
-        logger.info(f"   Tags: {tags}")
+        logger.info(f":test_tube: Test - Ticket #{ticket_id}, Subject: {subject[:50]}")
+        logger.info(f":gear: Mode: {'async (polling)' if async_mode else 'sync'}")
         
         mock_ticket = {
             "id": ticket_id or 99999,
             "subject": subject,
             "description": description,
+            "conversation": conversation,
             "tags": tags,
             "status": "open",
-            "organization_id": org_id
+            "organization_id": None
         }
         
         question = webhook_handler.build_question_from_ticket(mock_ticket, zendesk_subdomain)
-        logger.info(f":test_tube: Test question built (length: {len(question)} chars)")
+        
+        # ASYNC MODE: Job tracking
+        if async_mode:
+            job_id = create_job(ticket_id or 99999, data)
+            
+            async def process_test_with_job():
+                request_id = str(uuid.uuid4())[:8]
+                start_time = time.time()
+                
+                try:
+                    custom_ttl = 0 if force_reprocess else bart_client.test_processing_ttl
+                    result = await bart_client.ask(
+                        question, 
+                        ticket_id=ticket_id or 99999, 
+                        request_id=request_id,
+                        custom_ttl=custom_ttl
+                    )
+                    response = result["response"]
+                    slack_thread_url = result.get("slack_thread_url", "")
+                    elapsed = time.time() - start_time
+                    
+                    # Add comment if requested
+                    comment_added = False
+                    if ticket_id and add_comment:
+                        try:
+                            cleaned = webhook_handler.format_for_zendesk(response)
+                            formatted = f"🤖 **Bart's Response (Test):**\n\n{cleaned}\n\n---\n_Test response_"
+                            if slack_thread_url:
+                                formatted += f"\n\n💬 [View in Slack]({slack_thread_url})"
+                            zendesk_client.add_comment(ticket_id, formatted, public=False)
+                            comment_added = True
+                        except Exception as e:
+                            logger.warning(f":warning: Failed to post comment: {e}")
+                    
+                    update_job(job_id, "complete", {
+                        "status": "success",
+                        "response": response,
+                        "slack_thread_url": slack_thread_url,
+                        "processing_time_seconds": elapsed,
+                        "comment_added": comment_added
+                    })
+                except Exception as e:
+                    logger.error(f":x: Test error: {e}")
+                    update_job(job_id, "error", {"error": str(e)})
+            
+            background_tasks.add_task(process_test_with_job)
+            
+            return JSONResponse(status_code=202, content={
+                "status": "accepted",
+                "job_id": job_id,
+                "ticket_id": ticket_id or 99999,
+                "poll_url": f"/zendesk/job/{job_id}",
+                "message": f"Poll /zendesk/job/{job_id} every 10-30 seconds for status"
+            })
+        
+        # SYNC MODE: Wait for response (may timeout)
+        logger.info(f":test_tube: Synchronous mode - waiting for Bart...")
         
         request_id = str(uuid.uuid4())[:8]
         start_time = time.time()
         
-        result = await bart_client.ask(question, ticket_id=ticket_id or 99999, request_id=request_id)
+        custom_ttl = 0 if force_reprocess else bart_client.test_processing_ttl
+        
+        result = await bart_client.ask(
+            question,
+            ticket_id=ticket_id or 99999,
+            request_id=request_id,
+            custom_ttl=custom_ttl
+        )
         response = result["response"]
         slack_thread_url = result.get("slack_thread_url", "")
         elapsed = time.time() - start_time
         
-        if ticket_id:
-            # Clean up formatting
-            cleaned_response = webhook_handler.format_for_zendesk(response)
-            
-            formatted_response = (
-                f"🤖 **Bart's Response (Test):**\n\n{cleaned_response}\n\n"
-                f"---\n_Test response generated at {datetime.now(timezone.utc).isoformat()}Z_"
-            )
-            
-            # Add Slack thread link if available
-            if slack_thread_url:
-                formatted_response += f"\n\n💬 [View conversation in Slack]({slack_thread_url})"
-            
-            # Try to post comment to Zendesk (but don't fail if it times out)
-            comment_posted = False
-            zendesk_error = None
+        # Add comment if requested
+        comment_added = False
+        zendesk_error = None
+        if ticket_id and add_comment:
             try:
-                zendesk_client.add_comment(ticket_id, formatted_response, public=False)
-                comment_posted = True
-                logger.info(f":white_check_mark: Test comment posted to ticket #{ticket_id}")
-            except Exception as ze:
-                zendesk_error = str(ze)
-                logger.warning(f":warning: Failed to post test comment to Zendesk: {zendesk_error}")
-                logger.warning(f":warning: Continuing anyway - Bart response was successful")
-        else:
-            comment_posted = False
-            zendesk_error = "No ticket_id provided"
+                cleaned = webhook_handler.format_for_zendesk(response)
+                formatted = f"🤖 **Bart's Response (Test):**\n\n{cleaned}\n\n---\n_Test response_"
+                if slack_thread_url:
+                    formatted += f"\n\n💬 [View in Slack]({slack_thread_url})"
+                zendesk_client.add_comment(ticket_id, formatted, public=False)
+                comment_added = True
+            except Exception as e:
+                zendesk_error = str(e)
+                logger.warning(f":warning: Zendesk error: {e}")
         
         return {
             "status": "success",
-            "question": question,
             "response": response,
-            "deployment_type": webhook_handler.detect_deployment_type(tags),
-            "ticket_updated": comment_posted,
-            "zendesk_error": zendesk_error if not comment_posted else None,
-            "processing_time_seconds": elapsed,
             "slack_thread_url": slack_thread_url,
-            "note": "Bart responded successfully. Comment posting to Zendesk failed but that doesn't affect Bart's response." if zendesk_error else None
+            "processing_time_seconds": elapsed,
+            "ticket_updated": comment_added,
+            "comment_added": comment_added,
+            "zendesk_error": zendesk_error,
+            "note": "Use async_mode=true to avoid timeouts and enable polling"
         }
     
     except Exception as e:
-        logger.error(f":x: Test endpoint error: {e}")
+        logger.error(f":x: Test error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
