@@ -1583,16 +1583,31 @@ async def test_bart_question(request: Request):
             if slack_thread_url:
                 formatted_response += f"\n\n💬 [View conversation in Slack]({slack_thread_url})"
             
-            zendesk_client.add_comment(ticket_id, formatted_response, public=False)
+            # Try to post comment to Zendesk (but don't fail if it times out)
+            comment_posted = False
+            zendesk_error = None
+            try:
+                zendesk_client.add_comment(ticket_id, formatted_response, public=False)
+                comment_posted = True
+                logger.info(f":white_check_mark: Test comment posted to ticket #{ticket_id}")
+            except Exception as ze:
+                zendesk_error = str(ze)
+                logger.warning(f":warning: Failed to post test comment to Zendesk: {zendesk_error}")
+                logger.warning(f":warning: Continuing anyway - Bart response was successful")
+        else:
+            comment_posted = False
+            zendesk_error = "No ticket_id provided"
         
         return {
             "status": "success",
             "question": question,
             "response": response,
             "deployment_type": webhook_handler.detect_deployment_type(tags),
-            "ticket_updated": ticket_id is not None,
+            "ticket_updated": comment_posted,
+            "zendesk_error": zendesk_error if not comment_posted else None,
             "processing_time_seconds": elapsed,
-            "slack_thread_url": slack_thread_url
+            "slack_thread_url": slack_thread_url,
+            "note": "Bart responded successfully. Comment posting to Zendesk failed but that doesn't affect Bart's response." if zendesk_error else None
         }
     
     except Exception as e:
