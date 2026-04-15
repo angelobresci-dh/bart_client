@@ -38,6 +38,7 @@ from typing import Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from slack_sdk.web.async_client import AsyncWebClient
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
@@ -739,6 +740,15 @@ Instructions for your response:
 
 # FastAPI app
 app = FastAPI(title="Bart Zendesk Webhook Handler")
+
+# Add CORS middleware to allow requests from Zendesk apps and browsers
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allow all origins (or restrict to Zendesk domains)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all HTTP methods
+    allow_headers=["*"],  # Allow all headers
+)
 
 # Global clients
 bart_client: Optional[BartClient] = None
