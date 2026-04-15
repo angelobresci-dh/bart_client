@@ -698,6 +698,17 @@ class ZendeskWebhookHandler:
             ':fire:': '🔥',
             ':robot_face:': '🤖',
             ':speech_balloon:': '💬',
+            ':football:': '🏈',
+            ':soccer:': '⚽',
+            ':basketball:': '🏀',
+            ':hammer:': '🔨',
+            ':gear:': '⚙️',
+            ':computer:': '💻',
+            ':chart_with_upwards_trend:': '📈',
+            ':calendar:': '📅',
+            ':hourglass_flowing_sand:': '⏳',
+            ':lock:': '🔒',
+            ':unlock:': '🔓',
         }
         for code, emoji in emoji_map.items():
             text = text.replace(code, emoji)
