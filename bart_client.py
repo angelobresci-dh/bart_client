@@ -802,8 +802,9 @@ class ZendeskWebhookHandler:
     @staticmethod
     def format_for_zendesk(text: str) -> str:
         """
-        Basic cleanup for Zendesk comments (supports Markdown, so lighter touch).
-        Handles HTML entities and emoji codes.
+        Cleanup for Zendesk comments (supports Markdown).
+        Handles HTML entities, emoji codes, and ensures proper section breaks.
+        PRESERVES Markdown formatting since comments render it.
         """
         import html
         
@@ -829,6 +830,32 @@ class ZendeskWebhookHandler:
         }
         for code, emoji in emoji_map.items():
             text = text.replace(code, emoji)
+        
+        # 3. Ensure proper section breaks for regression analysis
+        # Look for regression section markers and ensure clear delineation
+        regression_patterns = [
+            r'REGRESSION ANALYSIS',
+            r'Regression Analysis',
+            r'Regression analysis',
+        ]
+        
+        for pattern in regression_patterns:
+            # Ensure there's a --- separator and proper spacing before regression section
+            # Pattern: text\n\n---\n\n**REGRESSION ANALYSIS**
+            text = re.sub(
+                rf'([^\n])\s*\n+\**{pattern}\**',
+                rf'\1\n\n---\n\n**{pattern.upper()}**',
+                text
+            )
+            # Also handle if there's already a --- but not enough spacing
+            text = re.sub(
+                rf'([^\n])\s*\n+---+\s*\n+\**{pattern}\**',
+                rf'\1\n\n---\n\n**{pattern.upper()}**',
+                text
+            )
+        
+        # 4. Keep Markdown formatting (bold, italic, code blocks)
+        # Comments support Markdown, so preserve all formatting
         
         return text
     
@@ -1518,14 +1545,17 @@ async def test_bart_question(request: Request):
         elapsed = time.time() - start_time
         
         if ticket_id:
+            # Clean up formatting
+            cleaned_response = webhook_handler.format_for_zendesk(response)
+            
             formatted_response = (
-                f":robot_face: *Bart's Response (Test):*\n\n{response}\n\n"
-                f"---\n_Test response at {datetime.now(timezone.utc).isoformat()}Z_"
+                f"🤖 **Bart's Response (Test):**\n\n{cleaned_response}\n\n"
+                f"---\n_Test response generated at {datetime.now(timezone.utc).isoformat()}Z_"
             )
             
             # Add Slack thread link if available
             if slack_thread_url:
-                formatted_response += f"\n\n:speech_balloon: [View conversation in Slack]({slack_thread_url})"
+                formatted_response += f"\n\n💬 [View conversation in Slack]({slack_thread_url})"
             
             zendesk_client.add_comment(ticket_id, formatted_response, public=False)
         
