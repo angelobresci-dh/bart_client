@@ -167,6 +167,7 @@ class BartClient:
             "Regression analysis",
             "REGRESSION ANALYSIS",
             "Citations",
+            "citations",
             "Response"
         ]
         
