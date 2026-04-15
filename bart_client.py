@@ -145,7 +145,7 @@ class BartClient:
             return False
         
         working_indicators = [
-            r":mag:", r"\bSearching\b", r"\bLooking\b", r"\bAnalyzing\b", r":book:", r":wrench:"
+            r":mag:", r"\bSearching\b", r"\bLooking\b", r"\bAnalyzing\b", r":book:", r":wrench:",
             r"\bChecking\b", r"Ay caramba", r"Don't have a cow"
         ]
         
@@ -294,9 +294,10 @@ class BartClient:
             log.info(f"   [{request_id}] Total messages: {len(self.pending_responses[thread_ts]['messages'])}")
     
     async def _wait_for_completion(self, thread_ts: str, timeout: float):
-        """Wait for Bart to finish responding"""
+        """Wait for Bart to finish responding with periodic polling to catch missed events"""
         request_id = self.pending_responses[thread_ts].get("request_id", "unknown")
         start_time = time.time()
+        last_fetch_time = time.time()  # Track last poll time
         
         while True:
             elapsed = time.time() - start_time
@@ -305,6 +306,92 @@ class BartClient:
                 raise TimeoutError(f"Bart didn't finish within {timeout} seconds")
             
             messages = self.pending_responses[thread_ts]["messages"]
+            
+            # Periodically poll thread to catch messages missed by WebSocket
+            if time.time() - last_fetch_time > 15:  # Poll every 15 seconds
+                try:
+                    logger.info(f":arrows_counterclockwise: [{request_id}] Polling thread for updates (in case WebSocket missed edits)...")
+                    thread_history = await self.client.conversations_replies(
+                        channel=self.channel_id,
+                        ts=thread_ts,
+                        limit=100
+                    )
+                    
+                    thread_messages = thread_history.get("messages", [])[1:]  # Skip our question
+                    for msg in thread_messages:
+                        if msg.get("user") == self.BART_USER_ID:
+                            text = msg.get("text", "")
+                            ts = msg.get("ts")
+                            
+                            # Extract from blocks if needed
+                            if msg.get("blocks") and len(text) < 1000:
+                                try:
+                                    block_texts = []
+                                    for block in msg.get("blocks", []):
+                                        if block.get("type") == "rich_text":
+                                            section_texts = []
+                                            for element in block.get("elements", []):
+                                                if element.get("type") == "rich_text_section":
+                                                    for item in element.get("elements", []):
+                                                        if item.get("text"):
+                                                            section_texts.append(item["text"])
+                                                elif element.get("type") == "rich_text_list":
+                                                    for list_item in element.get("elements", []):
+                                                        for item in list_item.get("elements", []):
+                                                            if item.get("text"):
+                                                                section_texts.append(item["text"])
+                                            if section_texts:
+                                                block_texts.append("".join(section_texts))
+                                        elif block.get("text"):
+                                            if isinstance(block["text"], dict):
+                                                block_texts.append(block["text"].get("text", ""))
+                                            else:
+                                                block_texts.append(block["text"])
+                                    
+                                    if block_texts:
+                                        full_text = "\n".join(block_texts)
+                                        if len(full_text) > len(text):
+                                            logger.info(f":arrows_counterclockwise: [{request_id}] Extracted fuller text from blocks in polling: {len(full_text)} chars (vs {len(text)})")
+                                            text = full_text
+                                except Exception as e:
+                                    logger.warning(f":warning: [{request_id}] Failed to extract from blocks during polling: {e}")
+                            
+                            # Find if this message already exists
+                            existing_idx = None
+                            for idx, m in enumerate(messages):
+                                if m["ts"] == ts:
+                                    existing_idx = idx
+                                    break
+                            
+                            is_working = self.is_working_message(text)
+                            is_final = self.is_final_message(text)
+                            
+                            if existing_idx is not None:
+                                # Update if content changed
+                                if messages[existing_idx]["text"] != text:
+                                    logger.info(f":arrows_counterclockwise: [{request_id}] Updated message via polling (ts: {ts}, is_final={is_final}, length={len(text)})")
+                                    messages[existing_idx] = {
+                                        "text": text,
+                                        "ts": ts,
+                                        "is_working": is_working,
+                                        "is_final": is_final
+                                    }
+                                    self.pending_responses[thread_ts]["last_message_time"] = time.time()
+                            else:
+                                # New message found via polling
+                                logger.info(f":arrows_counterclockwise: [{request_id}] Found new message via polling (ts: {ts}, is_final={is_final}, length={len(text)})")
+                                messages.append({
+                                    "text": text,
+                                    "ts": ts,
+                                    "is_working": is_working,
+                                    "is_final": is_final
+                                })
+                                self.pending_responses[thread_ts]["last_message_time"] = time.time()
+                    
+                    last_fetch_time = time.time()
+                except Exception as e:
+                    logger.warning(f":warning: [{request_id}] Failed to poll thread: {e}")
+            
             if not messages:
                 await asyncio.sleep(1)
                 continue
@@ -422,6 +509,74 @@ class BartClient:
                 "ticket_id": ticket_id,
                 "request_id": request_id
             }
+            
+            # Proactively check for existing messages (in case Bart responded before tracking setup)
+            logger.info(f":mag: [{request_id}] Checking for existing messages in thread...")
+            try:
+                thread_history = await self.client.conversations_replies(
+                    channel=self.channel_id,
+                    ts=message_ts,
+                    limit=100
+                )
+                
+                existing_messages = thread_history.get("messages", [])[1:]  # Skip our question
+                if existing_messages:
+                    logger.info(f":mag: [{request_id}] Found {len(existing_messages)} existing message(s) in thread")
+                    
+                    for msg in existing_messages:
+                        if msg.get("user") == self.BART_USER_ID:
+                            text = msg.get("text", "")
+                            ts = msg.get("ts")
+                            
+                            # Extract from blocks if needed
+                            if msg.get("blocks") and len(text) < 1000:
+                                try:
+                                    block_texts = []
+                                    for block in msg.get("blocks", []):
+                                        if block.get("type") == "rich_text":
+                                            section_texts = []
+                                            for element in block.get("elements", []):
+                                                if element.get("type") == "rich_text_section":
+                                                    for item in element.get("elements", []):
+                                                        if item.get("text"):
+                                                            section_texts.append(item["text"])
+                                                elif element.get("type") == "rich_text_list":
+                                                    for list_item in element.get("elements", []):
+                                                        for item in list_item.get("elements", []):
+                                                            if item.get("text"):
+                                                                section_texts.append(item["text"])
+                                            if section_texts:
+                                                block_texts.append("".join(section_texts))
+                                        elif block.get("text"):
+                                            if isinstance(block["text"], dict):
+                                                block_texts.append(block["text"].get("text", ""))
+                                            else:
+                                                block_texts.append(block["text"])
+                                    
+                                    if block_texts:
+                                        full_text = "\n".join(block_texts)
+                                        if len(full_text) > len(text):
+                                            logger.info(f":mag: [{request_id}] Extracted fuller text from blocks (proactive): {len(full_text)} chars")
+                                            text = full_text
+                                except Exception as e:
+                                    logger.warning(f":warning: [{request_id}] Failed to extract from blocks: {e}")
+                            
+                            is_working = self.is_working_message(text)
+                            is_final = self.is_final_message(text)
+                            
+                            logger.info(f":mag: [{request_id}] Proactive fetch: message ts={ts}, is_final={is_final}, length={len(text)}")
+                            
+                            self.pending_responses[message_ts]["messages"].append({
+                                "text": text,
+                                "ts": ts,
+                                "is_working": is_working,
+                                "is_final": is_final
+                            })
+                            self.pending_responses[message_ts]["last_message_time"] = time.time()
+                else:
+                    logger.info(f":mag: [{request_id}] No existing messages found (thread is new)")
+            except Exception as e:
+                logger.warning(f":warning: [{request_id}] Failed to check for existing messages: {e}")
             
             try:
                 await self._wait_for_completion(message_ts, timeout)
