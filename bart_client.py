@@ -59,12 +59,13 @@ class BartClient:
     """Async Bart client using WebSocket (Socket Mode) with smart message collection"""
     BART_USER_ID = "U09RYUJDUQL"
     
-    def __init__(self, bot_token: str, app_token: str, channel_id: str, timeout: float = 600.0, 
-                 completion_wait: float = 120.0, fallback_wait: float = 540.0):
+    def __init__(self, bot_token: str, app_token: str, channel_id: str, zendesk_subdomain: str,
+                 timeout: float = 600.0, completion_wait: float = 120.0, fallback_wait: float = 540.0):
         self.client = AsyncWebClient(token=bot_token)
         self.app = AsyncApp(token=bot_token)
         self.app_token = app_token
         self.channel_id = channel_id
+        self.zendesk_subdomain = zendesk_subdomain
         self.default_timeout = timeout
         self.completion_wait = completion_wait
         self.fallback_wait = fallback_wait
@@ -338,10 +339,13 @@ class BartClient:
         logger.info(f":clipboard: [{request_id}] Concatenated {len(meaningful_messages)} messages")
         return "\n\n".join(texts)
     
-    async def _post_question(self, question: str, request_id: str) -> str:
+    async def _post_question(self, question: str, ticket_id: int, zendesk_subdomain: str, request_id: str) -> str:
         """Post question to Slack"""
         formatted_question = f"<@{self.BART_USER_ID}> {question}"
         MAX_MESSAGE_LENGTH = 3000
+        
+        # Build ticket URL
+        ticket_url = f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket_id}"
         
         if len(formatted_question) <= MAX_MESSAGE_LENGTH:
             logger.info(f":outbox_tray: [{request_id}] Posting question ({len(formatted_question)} chars)")
@@ -357,7 +361,8 @@ class BartClient:
         else:
             logger.info(f":outbox_tray: [{request_id}] Question too long ({len(formatted_question)} chars), using file")
             
-            summary = f"<@{self.BART_USER_ID}> Please review the ticket details in the text file attached to this message and provide your response. Instructions are at the end of the file."
+            # Include Zendesk ticket URL in the summary message
+            summary = f"<@{self.BART_USER_ID}> Please review the ticket details in the text file attached to this message and provide your response. Instructions are at the end of the file. This is in reference to Zendesk ticket: {ticket_url}"
             
             file_result = await self.client.files_upload_v2(
                 channel=self.channel_id,
@@ -367,7 +372,7 @@ class BartClient:
                 initial_comment=summary
             )
             
-            logger.info(f":white_check_mark: [{request_id}] File uploaded")
+            logger.info(f":white_check_mark: [{request_id}] File uploaded with Zendesk URL: {ticket_url}")
             
             await asyncio.sleep(0.5)
             
@@ -402,7 +407,7 @@ class BartClient:
             if timeout is None:
                 timeout = self.default_timeout
             
-            message_ts = await self._post_question(question, request_id)
+            message_ts = await self._post_question(question, ticket_id, self.zendesk_subdomain, request_id)
             logger.info(f":mag: [{request_id}] Tracking thread: {message_ts}")
             
             self.pending_responses[message_ts] = {
@@ -857,6 +862,7 @@ async def startup_event():
         bot_token=bot_token,
         app_token=app_token,
         channel_id=channel_id,
+        zendesk_subdomain=zendesk_subdomain,
         timeout=bart_timeout,
         completion_wait=bart_completion_wait,
         fallback_wait=bart_fallback_wait
