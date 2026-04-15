@@ -1513,16 +1513,42 @@ async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks):
 
 @app.post("/zendesk/test")
 async def test_bart_question(request: Request):
-    """Test endpoint for asking Bart questions directly"""
+    """Test endpoint for asking Bart questions directly - handles both simple and webhook formats"""
     try:
         data = await request.json()
-        subject = data.get("subject", "")
-        description = data.get("description", "")
-        ticket_id = data.get("ticket_id")
-        tags = data.get("tags", [])
+        
+        # Check if this is a Zendesk webhook format (has 'detail' field)
+        if "detail" in data:
+            # Zendesk webhook format
+            logger.info(":test_tube: Detected Zendesk webhook format in test endpoint")
+            ticket_detail = data.get("detail", {})
+            
+            # Extract ticket ID
+            ticket_id_raw = ticket_detail.get("id")
+            ticket_id = int(ticket_id_raw) if ticket_id_raw else None
+            
+            subject = ticket_detail.get("subject", "")
+            description = ticket_detail.get("description", "")
+            tags = ticket_detail.get("tags", [])
+            org_id_raw = ticket_detail.get("organization_id")
+            org_id = int(org_id_raw) if org_id_raw else None
+        else:
+            # Simple test format
+            logger.info(":test_tube: Using simple test payload format")
+            subject = data.get("subject", "")
+            description = data.get("description", "")
+            ticket_id = data.get("ticket_id")
+            tags = data.get("tags", [])
+            org_id = None
         
         if not subject and not description:
             raise HTTPException(status_code=400, detail="Missing 'subject' or 'description' field")
+        
+        logger.info(f":test_tube: Test request extracted:")
+        logger.info(f"   Ticket ID: {ticket_id}")
+        logger.info(f"   Subject: {subject[:100] if subject else '(empty)'}")
+        logger.info(f"   Description: {description[:100] if description else '(empty)'}...")
+        logger.info(f"   Tags: {tags}")
         
         mock_ticket = {
             "id": ticket_id or 99999,
@@ -1530,11 +1556,11 @@ async def test_bart_question(request: Request):
             "description": description,
             "tags": tags,
             "status": "open",
-            "organization_id": None
+            "organization_id": org_id
         }
         
         question = webhook_handler.build_question_from_ticket(mock_ticket, zendesk_subdomain)
-        logger.info(f":test_tube: Test question:\n{question}")
+        logger.info(f":test_tube: Test question built (length: {len(question)} chars)")
         
         request_id = str(uuid.uuid4())[:8]
         start_time = time.time()
