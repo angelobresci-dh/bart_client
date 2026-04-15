@@ -145,7 +145,7 @@ class BartClient:
             return False
         
         working_indicators = [
-            r":mag:", r"\bSearching\b", r"\bLooking\b", r"\bAnalyzing\b",
+            r":mag:", r"\bSearching\b", r"\bLooking\b", r"\bAnalyzing\b", r":book:", r":wrench:"
             r"\bChecking\b", r"Ay caramba", r"Don't have a cow"
         ]
         
@@ -162,7 +162,12 @@ class BartClient:
         """Detect if message is a final response"""
         final_indicators = [
             "All repos already up-to-date",
-            ":white_check_mark: All repos already up-to-date"
+            ":white_check_mark: All repos already up-to-date",
+            "Regression Analysis",
+            "Regression analysis",
+            "REGRESSION ANALYSIS",
+            "Citations",
+            "Response"
         ]
         
         for indicator in final_indicators:
