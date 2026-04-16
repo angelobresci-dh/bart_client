@@ -853,10 +853,19 @@ Instructions for your response:
             
             result = await self.bart.ask(question, ticket_id=ticket_id, request_id=request_id, custom_ttl=ttl_to_use)
             bart_response = result["response"]
+            response_ticket_id = result["ticket_id"]  # Get ticket_id from response
             slack_thread_url = result.get("slack_thread_url", "")
+            
+            # CRITICAL: Verify we got the right ticket_id back (race condition detection)
+            if response_ticket_id != ticket_id:
+                logger.error(f":x: [{request_id}] RACE CONDITION DETECTED!")
+                logger.error(f"   Expected ticket #{ticket_id}, but response is for ticket #{response_ticket_id}")
+                logger.error(f"   This indicates a thread tracking mixup - using response ticket_id to prevent misposting")
+                ticket_id = response_ticket_id  # Use the correct ticket_id from response
             
             elapsed = time.time() - start_time
             logger.info(f":white_check_mark: [{request_id}] Bart responded in {elapsed:.1f}s")
+            logger.info(f":white_check_mark: [{request_id}] Response is for ticket #{response_ticket_id}")
             
             # EMOJI DECODING: Apply formatting cleanup
             cleaned_response = self.format_for_zendesk(bart_response)
@@ -873,14 +882,16 @@ Instructions for your response:
                 formatted_response += f"\n\n💬 [View conversation in Slack]({slack_thread_url})"
             
             if add_comment:
-                self.zendesk.add_comment(ticket_id=ticket_id, comment_text=formatted_response, public=False)
+                # Use response_ticket_id to ensure we post to the correct ticket
+                logger.info(f":memo: [{request_id}] Adding comment to ticket #{response_ticket_id}")
+                self.zendesk.add_comment(ticket_id=response_ticket_id, comment_text=formatted_response, public=False)
             
-            logger.info(f":white_check_mark: [{request_id}] Successfully processed #{ticket_id}")
+            logger.info(f":white_check_mark: [{request_id}] Successfully processed #{response_ticket_id}")
             logger.info(f"{'='*80}")
             
             return {
                 "status": "success",
-                "ticket_id": ticket_id,
+                "ticket_id": response_ticket_id,  # Return the actual ticket_id from response
                 "deployment_type": deployment_type,
                 "response_length": len(bart_response),
                 "processing_time_seconds": elapsed,
@@ -1359,18 +1370,26 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                         custom_ttl=custom_ttl
                     )
                     response = result["response"]
+                    response_ticket_id = result["ticket_id"]  # Get ticket_id from response
                     slack_thread_url = result.get("slack_thread_url", "")
                     elapsed = time.time() - start_time
                     
-                    # Add comment if requested
+                    # Verify ticket ID matches
+                    requested_ticket_id = ticket_id or 99999
+                    if response_ticket_id != requested_ticket_id:
+                        logger.error(f":x: RACE CONDITION in test endpoint!")
+                        logger.error(f"   Requested ticket #{requested_ticket_id}, got response for #{response_ticket_id}")
+                    
+                    # Add comment if requested (use response_ticket_id for safety)
                     comment_added = False
-                    if ticket_id and add_comment:
+                    if response_ticket_id and response_ticket_id != 99999 and add_comment:
                         try:
                             cleaned = webhook_handler.format_for_zendesk(response)
                             formatted = f"🤖 **Bart's Response (Test):**\n\n{cleaned}\n\n---\n_Test response_"
                             if slack_thread_url:
                                 formatted += f"\n\n💬 [View in Slack]({slack_thread_url})"
-                            zendesk_client.add_comment(ticket_id, formatted, public=False)
+                            logger.info(f":memo: Posting test comment to ticket #{response_ticket_id}")
+                            zendesk_client.add_comment(response_ticket_id, formatted, public=False)
                             comment_added = True
                         except Exception as e:
                             logger.warning(f":warning: Failed to post comment: {e}")
@@ -1378,6 +1397,7 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                     update_job(job_id, "complete", {
                         "status": "success",
                         "response": response,
+                        "ticket_id": response_ticket_id,  # Use actual ticket_id from response
                         "slack_thread_url": slack_thread_url,
                         "processing_time_seconds": elapsed,
                         "comment_added": comment_added
@@ -1411,19 +1431,27 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
             custom_ttl=custom_ttl
         )
         response = result["response"]
+        response_ticket_id = result["ticket_id"]  # Get ticket_id from response
         slack_thread_url = result.get("slack_thread_url", "")
         elapsed = time.time() - start_time
         
-        # Add comment if requested
+        # Verify ticket ID matches
+        requested_ticket_id = ticket_id or 99999
+        if response_ticket_id != requested_ticket_id:
+            logger.error(f":x: RACE CONDITION in sync test endpoint!")
+            logger.error(f"   Requested ticket #{requested_ticket_id}, got response for #{response_ticket_id}")
+        
+        # Add comment if requested (use response_ticket_id for safety)
         comment_added = False
         zendesk_error = None
-        if ticket_id and add_comment:
+        if response_ticket_id and response_ticket_id != 99999 and add_comment:
             try:
                 cleaned = webhook_handler.format_for_zendesk(response)
                 formatted = f"🤖 **Bart's Response (Test):**\n\n{cleaned}\n\n---\n_Test response_"
                 if slack_thread_url:
                     formatted += f"\n\n💬 [View in Slack]({slack_thread_url})"
-                zendesk_client.add_comment(ticket_id, formatted, public=False)
+                logger.info(f":memo: Posting test comment to ticket #{response_ticket_id}")
+                zendesk_client.add_comment(response_ticket_id, formatted, public=False)
                 comment_added = True
             except Exception as e:
                 zendesk_error = str(e)
@@ -1432,6 +1460,7 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
         return {
             "status": "success",
             "response": response,
+            "ticket_id": response_ticket_id,  # Return actual ticket_id from response
             "slack_thread_url": slack_thread_url,
             "processing_time_seconds": elapsed,
             "ticket_updated": comment_added,
