@@ -519,9 +519,29 @@ class BartClient:
                     limit=100
                 )
                 
+                # Verify the first message in thread is our question
+                all_messages = thread_history.get("messages", [])
+                if all_messages:
+                    first_message = all_messages[0]
+                    first_message_ts = first_message.get("ts")
+                    
+                    # Verify thread parent timestamp matches our question
+                    if first_message_ts != message_ts:
+                        logger.error(f":x: [{request_id}] THREAD VALIDATION FAILED!")
+                        logger.error(f"   Expected parent ts={message_ts}")
+                        logger.error(f"   Got parent ts={first_message_ts}")
+                        logger.error(f"   This indicates we're tracking the WRONG thread!")
+                        raise ValueError(f"Thread validation failed - tracking wrong thread")
+                    
+                    # Check if our @mention is in the first message
+                    first_text = first_message.get("text", "")
+                    if f"<@{self.BART_USER_ID}>" not in first_text:
+                        logger.warning(f":warning: [{request_id}] First message doesn't contain @Bart mention")
+                        logger.warning(f"   This might not be our thread!")
+                
                 existing_messages = thread_history.get("messages", [])[1:]  # Skip our question
                 if existing_messages:
-                    logger.info(f":mag: [{request_id}] Found {len(existing_messages)} existing message(s) in thread")
+                    logger.info(f":mag: [{request_id}] Found {len(existing_messages)} existing message(s) in thread {message_ts}")
                     
                     for msg in existing_messages:
                         if msg.get("user") == self.BART_USER_ID:
@@ -565,6 +585,7 @@ class BartClient:
                             is_final = self.is_final_message(text)
                             
                             logger.info(f":mag: [{request_id}] Proactive fetch: message ts={ts}, is_final={is_final}, length={len(text)}")
+                            logger.info(f":mag: [{request_id}] Message content preview: {text[:300]}...")
                             
                             self.pending_responses[message_ts]["messages"].append({
                                 "text": text,
@@ -847,6 +868,10 @@ Instructions for your response:
         question = self.build_question_from_ticket(ticket, zendesk_subdomain)
         deployment_type = self.detect_deployment_type(ticket.get("tags", []))
         
+        logger.info(f":thinking_face: [{request_id}] Built question for ticket #{ticket_id}")
+        logger.info(f"   Ticket data used: ID={ticket.get('id')}, Subject={ticket.get('subject', '')[:60]}...")
+        logger.info(f"   Question preview: {question[:200]}...")
+        
         try:
             logger.info(f":robot_face: [{request_id}] Asking Bart...")
             start_time = time.time()
@@ -866,6 +891,7 @@ Instructions for your response:
             elapsed = time.time() - start_time
             logger.info(f":white_check_mark: [{request_id}] Bart responded in {elapsed:.1f}s")
             logger.info(f":white_check_mark: [{request_id}] Response is for ticket #{response_ticket_id}")
+            logger.info(f":mag: [{request_id}] Response content preview: {bart_response[:300]}...")
             
             # EMOJI DECODING: Apply formatting cleanup
             cleaned_response = self.format_for_zendesk(bart_response)
@@ -1272,6 +1298,18 @@ async def get_zendesk_ticket(ticket_id: int, background_tasks: BackgroundTasks,
             })
         
         ticket = zendesk_client.get_ticket(ticket_id)
+        
+        logger.info(f":inbox_tray: Fetched ticket from Zendesk:")
+        logger.info(f"   Requested ID: {ticket_id}")
+        logger.info(f"   Fetched ID: {ticket.id}")
+        logger.info(f"   Subject: {ticket.subject[:80]}")
+        logger.info(f"   Status: {ticket.status}")
+        
+        # Verify we got the right ticket
+        if ticket.id != ticket_id:
+            logger.error(f":x: ZENDESK API RETURNED WRONG TICKET!")
+            logger.error(f"   Requested #{ticket_id}, got #{ticket.id}")
+            logger.error(f"   Using fetched ticket ID #{ticket.id} to prevent mixup")
         
         payload = {
             "event_type": "ticket.get",
