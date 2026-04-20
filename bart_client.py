@@ -734,6 +734,7 @@ class ZendeskWebhookHandler:
             ':clipboard:': '📋',
             ':date:': '📅',
             ':busts_in_silhouette:': '👥',
+            ':bustsinsilhouette:': '👥',
             ':zap:': '⚡',
             ':shield:': '🛡️',
             ':repeat:': '🔁',
@@ -741,6 +742,7 @@ class ZendeskWebhookHandler:
             ':large_green_circle:': '🟢',
             ':largeyellowcircle:': '🟡',
             ':largegreencircle:': '🟢',
+            ':rotating_light:': '🚨',
         }
         for code, emoji in emoji_map.items():
             text = text.replace(code, emoji)
