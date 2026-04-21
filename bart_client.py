@@ -469,16 +469,42 @@ class BartClient:
             
             await asyncio.sleep(0.5)
             
+            # Get the most recent message (should be our file upload comment)
             history_response = await self.client.conversations_history(
                 channel=self.channel_id,
-                limit=1
+                limit=5  # Get last 5 to verify we find ours
             )
             
             if not history_response.get("messages"):
                 raise ValueError("No messages in history")
             
-            message_ts = str(history_response["messages"][0]["ts"])
-            logger.info(f":white_check_mark: [{request_id}] Got timestamp: {message_ts}")
+            # Find OUR message by looking for our @mention and request_id
+            our_message = None
+            for msg in history_response["messages"]:
+                msg_text = msg.get("text", "")
+                msg_ts = msg.get("ts")
+                
+                # Check if this message has our @mention
+                if f"<@{self.BART_USER_ID}>" in msg_text:
+                    # Check if it mentions our ticket_id
+                    if str(ticket_id) in msg_text:
+                        # Check if it's very recent (within last 5 seconds)
+                        msg_time = float(msg_ts)
+                        current_time = time.time()
+                        age = current_time - msg_time
+                        
+                        if age < 5:  # Message is less than 5 seconds old
+                            logger.info(f":white_check_mark: [{request_id}] Found our message: ts={msg_ts}, age={age:.2f}s")
+                            our_message = msg
+                            break
+            
+            if not our_message:
+                logger.error(f":x: [{request_id}] Could not find our file upload message in recent history!")
+                logger.error(f"   Checked {len(history_response['messages'])} recent messages")
+                raise ValueError("File upload message not found in recent history")
+            
+            message_ts = str(our_message["ts"])
+            logger.info(f":white_check_mark: [{request_id}] Validated timestamp: {message_ts} for ticket #{ticket_id}")
             
             return message_ts
     
@@ -519,34 +545,67 @@ class BartClient:
                     limit=100
                 )
                 
-                # Verify the first message in thread is our question
+                # CRITICAL: Verify this is actually OUR thread
                 all_messages = thread_history.get("messages", [])
                 if all_messages:
                     first_message = all_messages[0]
                     first_message_ts = first_message.get("ts")
+                    first_message_text = first_message.get("text", "")
                     
-                    # Verify thread parent timestamp matches our question
+                    # Verify parent timestamp matches
                     if first_message_ts != message_ts:
                         logger.error(f":x: [{request_id}] THREAD VALIDATION FAILED!")
-                        logger.error(f"   Expected parent ts={message_ts}")
-                        logger.error(f"   Got parent ts={first_message_ts}")
-                        logger.error(f"   This indicates we're tracking the WRONG thread!")
-                        raise ValueError(f"Thread validation failed - tracking wrong thread")
+                        logger.error(f"   Expected parent ts={message_ts}, got ts={first_message_ts}")
+                        logger.error(f"   We are tracking the WRONG thread!")
+                        raise ValueError(f"Thread validation failed - parent ts mismatch")
                     
-                    # Check if our @mention is in the first message
-                    first_text = first_message.get("text", "")
-                    if f"<@{self.BART_USER_ID}>" not in first_text:
-                        logger.warning(f":warning: [{request_id}] First message doesn't contain @Bart mention")
-                        logger.warning(f"   This might not be our thread!")
+                    # Verify our @mention is present
+                    if f"<@{self.BART_USER_ID}>" not in first_message_text:
+                        logger.error(f":x: [{request_id}] First message missing @Bart mention!")
+                        logger.error(f"   This is NOT our thread!")
+                        raise ValueError(f"Thread validation failed - no @Bart mention")
+                    
+                    # For file uploads, verify the request_id is in the filename or title
+                    if "file" in first_message_text.lower() or "attached" in first_message_text.lower():
+                        # This was a file upload - verify it's OUR file
+                        if request_id not in str(first_message.get("files", [])):
+                            logger.warning(f":warning: [{request_id}] File upload thread but request_id not found in files")
+                            logger.warning(f"   This might be a different file upload!")
+                    
+                    # Verify ticket ID appears in the message
+                    if str(ticket_id) not in first_message_text:
+                        logger.warning(f":warning: [{request_id}] Ticket #{ticket_id} not mentioned in first message")
+                        logger.warning(f"   First message text: {first_message_text[:200]}")
+                        logger.warning(f"   This might be for a different ticket!")
                 
                 existing_messages = thread_history.get("messages", [])[1:]  # Skip our question
                 if existing_messages:
                     logger.info(f":mag: [{request_id}] Found {len(existing_messages)} existing message(s) in thread {message_ts}")
                     
+                    # CRITICAL: Verify these messages are actually responses to OUR question
+                    # They should have timestamps AFTER our message_ts, not before
+                    our_timestamp = float(message_ts)
+                    
                     for msg in existing_messages:
                         if msg.get("user") == self.BART_USER_ID:
                             text = msg.get("text", "")
                             ts = msg.get("ts")
+                            msg_timestamp = float(ts)
+                            
+                            # Check if this message is BEFORE our question (impossible - indicates wrong thread!)
+                            if msg_timestamp < our_timestamp:
+                                logger.error(f":x: [{request_id}] MESSAGE TIMESTAMP VIOLATION!")
+                                logger.error(f"   Our question ts={our_timestamp}")
+                                logger.error(f"   Found message ts={msg_timestamp} (BEFORE our question!)")
+                                logger.error(f"   This message cannot be a response to our question!")
+                                logger.error(f"   Likely tracking WRONG thread or timestamp extraction failed!")
+                                raise ValueError(f"Found message with timestamp BEFORE our question - wrong thread")
+                            
+                            # Check if message is suspiciously close (< 2 seconds) which might indicate wrong thread
+                            time_diff = msg_timestamp - our_timestamp
+                            if time_diff < 2.0:
+                                logger.warning(f":warning: [{request_id}] Message appeared very quickly ({time_diff:.2f}s after question)")
+                                logger.warning(f"   This is unusually fast - verifying it's actually for us...")
                             
                             # Extract from blocks if needed
                             if msg.get("blocks") and len(text) < 1000:
@@ -672,9 +731,12 @@ class ZendeskClient:
             bart_signature = "This response was automatically generated by Bart"
             
             for comment in comments:
-                if comment.created_at and comment.created_at.replace(tzinfo=timezone.utc) > cutoff_time:
-                    if comment.body and bart_signature in comment.body:
-                        return True
+                if comment.created_at:
+                    # Handle both timezone-aware and naive datetimes
+                    comment_time = comment.created_at if comment.created_at.tzinfo else comment.created_at.replace(tzinfo=timezone.utc)
+                    if comment_time > cutoff_time:
+                        if comment.body and bart_signature in comment.body:
+                            return True
             
             return False
         except Exception as e:
