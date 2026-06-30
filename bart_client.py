@@ -837,6 +837,8 @@ class ZendeskWebhookHandler:
         """Detect deployment from tags"""
         if "on_premise" in tags:
             return "on_premise"
+        elif "oss__open_source_" in tags:
+            return "oss_open_source"
         return "cloud"
     
     def build_question_from_ticket(self, ticket: Dict[str, Any], zendesk_subdomain: str) -> str:
