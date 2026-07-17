@@ -6,6 +6,7 @@ Combines original job tracking with today's improvements:
 - Regression analysis prompts
 - Emoji decoding and formatting
 - Increased Zendesk timeout
+- bart-bot-processed tag on successful comment posting
 
 Requirements:
     pip install fastapi uvicorn slack-bolt slack-sdk python-dotenv zenpy aiohttp
@@ -742,6 +743,32 @@ class ZendeskClient:
         except Exception as e:
             logger.warning(f":warning: Failed to check comments: {e}")
             return False
+    
+    def add_tag_to_ticket(self, ticket_id: int, tag: str) -> bool:
+        """
+        Add a tag to a ticket.
+        Returns True if successful, False otherwise.
+        
+        Used to mark tickets after Bart successfully posts a response.
+        """
+        try:
+            ticket = self.zenpy_client.tickets(id=ticket_id)
+            
+            # Get current tags and add new one if not already present
+            current_tags = ticket.tags if hasattr(ticket, 'tags') and ticket.tags else []
+            
+            if tag not in current_tags:
+                current_tags.append(tag)
+                ticket.tags = current_tags
+                self.zenpy_client.tickets.update(ticket)
+                logger.info(f":label: Added tag '{tag}' to ticket #{ticket_id}")
+                return True
+            else:
+                logger.info(f":label: Tag '{tag}' already present on ticket #{ticket_id}")
+                return True
+        except Exception as e:
+            logger.error(f":x: Failed to add tag '{tag}' to ticket #{ticket_id}: {e}")
+            return False
 
 
 class ZendeskWebhookHandler:
@@ -805,6 +832,7 @@ class ZendeskWebhookHandler:
             ':largeyellowcircle:': '🟡',
             ':largegreencircle:': '🟢',
             ':rotating_light:': '🚨',
+            ':label:': '🏷️',
         }
         for code, emoji in emoji_map.items():
             text = text.replace(code, emoji)
@@ -987,10 +1015,29 @@ Instructions for your response:
             if slack_thread_url:
                 formatted_response += f"\n\n💬 [View conversation in Slack]({slack_thread_url})"
             
+            # NEW: Track comment success and tag addition
+            comment_added = False
+            tag_added = False
+            
             if add_comment:
                 # Use response_ticket_id to ensure we post to the correct ticket
                 logger.info(f":memo: [{request_id}] Adding comment to ticket #{response_ticket_id}")
-                self.zendesk.add_comment(ticket_id=response_ticket_id, comment_text=formatted_response, public=False)
+                try:
+                    self.zendesk.add_comment(ticket_id=response_ticket_id, comment_text=formatted_response, public=False)
+                    comment_added = True
+                    
+                    # ONLY tag the ticket after successfully posting the comment
+                    logger.info(f":label: [{request_id}] Successfully posted comment, adding 'bart-bot-processed' tag...")
+                    tag_result = self.zendesk.add_tag_to_ticket(response_ticket_id, "bart-bot-processed")
+                    if tag_result:
+                        tag_added = True
+                        logger.info(f":white_check_mark: [{request_id}] Tagged ticket #{response_ticket_id} as processed")
+                    else:
+                        logger.warning(f":warning: [{request_id}] Failed to add tag, but comment was posted successfully")
+                except Exception as e:
+                    logger.error(f":x: [{request_id}] Failed to add comment: {e}")
+                    comment_added = False
+                    tag_added = False
             
             logger.info(f":white_check_mark: [{request_id}] Successfully processed #{response_ticket_id}")
             logger.info(f"{'='*80}")
@@ -1004,7 +1051,9 @@ Instructions for your response:
                 "response": bart_response,
                 "formatted_response": formatted_response,
                 "slack_thread_url": slack_thread_url,
-                "comment_added": add_comment
+                "add_comment_requested": add_comment,
+                "comment_added": comment_added,
+                "tag_added": tag_added  # Tag only added if comment was successfully posted
             }
         
         except ValueError as e:
@@ -1013,23 +1062,37 @@ Instructions for your response:
         
         except TimeoutError as e:
             logger.error(f":alarm_clock: [{request_id}] Timeout: {e}")
+            # NO TAG ADDED - processing did not complete
             if add_comment:
                 self.zendesk.add_comment(
                     ticket_id=ticket_id,
                     comment_text=":alarm_clock: Bart took too long. Please try again.",
                     public=False
                 )
-            return {"status": "timeout", "ticket_id": ticket_id, "error": str(e)}
+            return {
+                "status": "timeout",
+                "ticket_id": ticket_id,
+                "error": str(e),
+                "comment_added": add_comment,
+                "tag_added": False  # CRITICAL: No tag on timeout
+            }
         
         except Exception as e:
             logger.error(f":x: [{request_id}] Error: {e}")
+            # NO TAG ADDED - processing failed
             if add_comment:
                 self.zendesk.add_comment(
                     ticket_id=ticket_id,
                     comment_text=f":x: Bart error: {str(e)}",
                     public=False
                 )
-            return {"status": "error", "ticket_id": ticket_id, "error": str(e)}
+            return {
+                "status": "error",
+                "ticket_id": ticket_id,
+                "error": str(e),
+                "comment_added": add_comment,
+                "tag_added": False  # CRITICAL: No tag on error
+            }
 
 
 # FastAPI app
@@ -1178,7 +1241,7 @@ async def startup_event():
     port = int(os.getenv("PORT", "8000"))
     base_url = public_url if public_url else f"http://localhost:{port}"
     
-    logger.info(":rocket: Bart Zendesk Webhook Handler - MERGED VERSION")
+    logger.info(":rocket: Bart Zendesk Webhook Handler - MERGED VERSION WITH TAG ENHANCEMENT")
     logger.info("=" * 80)
     logger.info(f"   Health:     GET  {base_url}/")
     logger.info(f"   Webhook:    POST {base_url}/zendesk/webhook")
@@ -1186,7 +1249,7 @@ async def startup_event():
     logger.info(f"   Test:       POST {base_url}/zendesk/test")
     logger.info(f"   Job Status: GET  {base_url}/zendesk/job/{{job_id}}")
     logger.info("")
-    logger.info(f"   Features: Job tracking, Block extraction, Regression analysis, Emoji decoding")
+    logger.info(f"   Features: Job tracking, Block extraction, Regression analysis, Emoji decoding, bart-bot-processed tag")
     logger.info("=" * 80)
 
 
@@ -1202,9 +1265,9 @@ async def health_check():
     """Health check"""
     return {
         "status": "healthy",
-        "service": "Bart Zendesk Webhook Handler - Merged Version",
+        "service": "Bart Zendesk Webhook Handler - Merged Version with Tag Enhancement",
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "features": ["job_tracking", "block_extraction", "regression_analysis", "emoji_decoding"]
+        "features": ["job_tracking", "block_extraction", "regression_analysis", "emoji_decoding", "bart_bot_processed_tag"]
     }
 
 
@@ -1500,6 +1563,7 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                     
                     # Add comment if requested (use response_ticket_id for safety)
                     comment_added = False
+                    tag_added = False
                     if response_ticket_id and response_ticket_id != 99999 and add_comment:
                         try:
                             cleaned = webhook_handler.format_for_zendesk(response)
@@ -1509,8 +1573,13 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                             logger.info(f":memo: Posting test comment to ticket #{response_ticket_id}")
                             zendesk_client.add_comment(response_ticket_id, formatted, public=False)
                             comment_added = True
+                            
+                            # Add tag after successful comment
+                            logger.info(f":label: Adding 'bart-bot-processed' tag...")
+                            tag_result = zendesk_client.add_tag_to_ticket(response_ticket_id, "bart-bot-processed")
+                            tag_added = tag_result
                         except Exception as e:
-                            logger.warning(f":warning: Failed to post comment: {e}")
+                            logger.warning(f":warning: Failed to post comment or tag: {e}")
                     
                     update_job(job_id, "complete", {
                         "status": "success",
@@ -1518,7 +1587,8 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                         "ticket_id": response_ticket_id,  # Use actual ticket_id from response
                         "slack_thread_url": slack_thread_url,
                         "processing_time_seconds": elapsed,
-                        "comment_added": comment_added
+                        "comment_added": comment_added,
+                        "tag_added": tag_added
                     })
                 except Exception as e:
                     logger.error(f":x: Test error: {e}")
@@ -1561,6 +1631,7 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
         
         # Add comment if requested (use response_ticket_id for safety)
         comment_added = False
+        tag_added = False
         zendesk_error = None
         if response_ticket_id and response_ticket_id != 99999 and add_comment:
             try:
@@ -1571,6 +1642,11 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                 logger.info(f":memo: Posting test comment to ticket #{response_ticket_id}")
                 zendesk_client.add_comment(response_ticket_id, formatted, public=False)
                 comment_added = True
+                
+                # Add tag after successful comment
+                logger.info(f":label: Adding 'bart-bot-processed' tag...")
+                tag_result = zendesk_client.add_tag_to_ticket(response_ticket_id, "bart-bot-processed")
+                tag_added = tag_result
             except Exception as e:
                 zendesk_error = str(e)
                 logger.warning(f":warning: Zendesk error: {e}")
@@ -1583,6 +1659,7 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
             "processing_time_seconds": elapsed,
             "ticket_updated": comment_added,
             "comment_added": comment_added,
+            "tag_added": tag_added,
             "zendesk_error": zendesk_error,
             "note": "Use async_mode=true to avoid timeouts and enable polling"
         }
