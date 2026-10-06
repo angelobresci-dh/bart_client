@@ -909,10 +909,11 @@ class ZendeskWebhookHandler:
         # IMPROVEMENT 2: Add regression analysis instructions
         additional_instructions = f"""
 ---
-Instructions for your response:
+Instructions and rules for your response:
 - Can you please provide a response based on the previous conversation?
 - Exclude any follow-up questions like 'Would you like more detail?' or 'Would you like me to create a GitHub issue to track this, or would you prefer to engage with your Acryl support team directly to get a fix prioritized?' from your response. This exchange will be terminated after your first response.
 - Please note that my request originated from this ticket: <{ticket_url}>. DO NOT use Zendesk ticket {ticket_id} as a reference or source in your response, because you will be self-referencing.
+- Please conform to the ASD-STE100 standard of Simplified Technical English for your entire response.
 - In any reference you do use to formulate a possible solution, please be sure to be clear in your response whether the solution you suggest actually did SOLVE similar issues in the past (example: referenced ticket status 'Solution Suggested' or 'Closed' in Zendesk or 'Done' in Linear) vs. it's something simply related to other open tickets ('Open', 'Pending Customer Response', etc.).
 - Please keep your interactions with any of the Github repositories to READ ONLY operations. DO NOT generate and submit any pull requests (PRs) directly. Instead, propose your PR suggestion via the response to the Support team via the Zendesk ticket. Allow the Support team to evaluate your proposal, rather than creating it directly in Github.
 - CRITICAL: Do NOT cite or reference any Linear issues, GitHub issues, or documentation that mention Zendesk ticket {ticket_id} or contain a link to <{ticket_url}>. These are circular references to the very request being asked about. Only reference external issues/documentation that are genuinely separate and unrelated to this ticket.
