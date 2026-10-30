@@ -704,7 +704,7 @@ class ZendeskClient:
         try:
             ticket = self.zenpy_client.tickets(id=ticket_id)
             # CRITICAL FIX: Format the comment for better Zendesk readability
-            formatted_comment = self.format_for_zendesk(comment_text)
+            formatted_comment = ZendeskClient.format_for_zendesk(comment_text)
             ticket.comment = Comment(body=formatted_comment, public=public)
             self.zenpy_client.tickets.update(ticket)
             logger.info(f":white_check_mark: Added comment to ticket #{ticket_id}")
