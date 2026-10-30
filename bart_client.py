@@ -770,13 +770,13 @@ class ZendeskClient:
                 regression_section = pattern + parts[1]
                 break
 
-        # STEP 2: AGGRESSIVE section header detection and formatting with HTML
-        # Use HTML bold tags (<b>text</b>) instead of markdown - Zendesk renders HTML better than markdown
+        # STEP 2: SECTION HEADER SPACING (NO HTML - preserves bullets and numbers)
+        # Add spacing around headers without HTML tags to preserve Zendesk list formatting
         # Pattern 1: "What X does" / "What Y can do" style headers - MOST CRITICAL
-        main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n<b>\2</b>\n\n', main_response)
+        main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n\2\n', main_response)
 
         # Pattern 2: All caps headers followed by colon: "SECTION:"
-        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n<b>\2</b>\n\n', main_response)
+        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n\2\n', main_response)
 
         # Pattern 3: Common section headers - "Past similar cases", "Still open:", "Solved or closed", "Closed in", etc.
         common_headers = [
@@ -792,11 +792,7 @@ class ZendeskClient:
             r'Nordea, ticket',
         ]
         for header_pattern in common_headers:
-            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n<b>\2</b>\n\n', main_response)
-
-        # CRITICAL FIX: Format the main title at the beginning if present
-        # Detect title pattern: "Title" or "Title (context)" at start, before first section
-        main_response = re.sub(r'^([A-Z][^\n]+)\n\n', r'<b>\1</b>\n\n', main_response)
+            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n\2\n', main_response)
 
         # Pattern 4: Add spacing around known major section keywords (Why, Summary, etc.)
         major_keywords = ['Why', 'Summary', 'Recommended', 'Result', 'Example', 'Note', 'Important', 'Status', 'Reference', 'Solution', 'Support-managed', 'Default role']
