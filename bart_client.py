@@ -784,13 +784,15 @@ class ZendeskWebhookHandler:
     @staticmethod
     def format_for_zendesk(text: str) -> str:
         """
-        EMOJI DECODING: Clean up HTML entities and convert emoji codes
+        EMOJI DECODING + IMPROVED FORMATTING: Clean up HTML entities, convert emoji codes,
+        and improve spacing for better readability in Zendesk comments.
+        IMPROVEMENT: Add proper paragraph spacing, visual breaks, and section formatting.
         """
         import html
-        
+
         # Decode HTML entities
         text = html.unescape(text)
-        
+
         # Convert emoji codes
         emoji_map = {
             ':dart:': '🎯',
@@ -836,17 +838,59 @@ class ZendeskWebhookHandler:
         }
         for code, emoji in emoji_map.items():
             text = text.replace(code, emoji)
-        
-        # Ensure proper section breaks before regression analysis
-        regression_patterns = ['REGRESSION ANALYSIS', 'Regression Analysis']
+
+        # IMPROVEMENT 1: Split by regression analysis section FIRST
+        # This prevents double-spacing issues in the analysis section
+        regression_patterns = ['## Regression Analysis', '## REGRESSION ANALYSIS', '## Regression analysis']
+        regression_section = None
+        main_response = text
+
         for pattern in regression_patterns:
-            text = re.sub(
-                rf'([^\n])\s*\n+\**{pattern}\**',
-                rf'\1\n\n---\n\n**{pattern.upper()}**',
-                text
-            )
-        
-        return text
+            if pattern in text:
+                parts = text.split(pattern, 1)
+                main_response = parts[0].rstrip()
+                regression_section = pattern + parts[1]
+                break
+
+        # IMPROVEMENT 2: Enhanced formatting for main response
+        # Add proper spacing after numbered items (1., 2., 3., etc.)
+        main_response = re.sub(r'(\d+\.\s+[^\n]+)\n([^\n])', r'\1\n\n\2', main_response)
+
+        # Add spacing around section header keywords
+        major_keywords = ['Why', 'Summary', 'Recommended', 'Result', 'Example', 'Note', 'Important', 'Status', 'Reference', 'Solution', 'Support-managed']
+        for keyword in major_keywords:
+            # Add double newline before keyword headers (e.g., "Why the...")
+            main_response = re.sub(rf'([^\n])\n({keyword}[^\n]*:)', r'\1\n\n\2', main_response)
+
+        # Add spacing after colons that end section headers
+        main_response = re.sub(r'([A-Z][a-zA-Z\s]+):\n([^\n])', r'\1:\n\n\2', main_response)
+
+        # Improve list item spacing - ensure double spacing before list items
+        main_response = re.sub(r'([^\n])\n(-\s+[^\n]+)', r'\1\n\n\2', main_response)
+
+        # Add visual breaks between major sections (detect by indent changes or keywords)
+        main_response = re.sub(r'\n\n([A-Z][a-zA-Z\s]+:)\n', r'\n\n---\n\n\1\n', main_response)
+
+        # IMPROVEMENT 3: Handle regression analysis section separately
+        if regression_section:
+            # Ensure proper spacing at the start of regression section
+            regression_section = regression_section.strip()
+
+            # Add double newline before "Percentage" and "Reasoning" in regression analysis
+            regression_section = re.sub(r'([^\n])\n(Percentage|Reasoning)', r'\1\n\n\2', regression_section)
+
+            # Add proper spacing after colons in regression analysis
+            regression_section = re.sub(r'([a-zA-Z]):\n([^\n])', r'\1:\n\n\2', regression_section)
+
+            # Combine with main response
+            text = main_response + '\n\n---\n\n' + regression_section
+        else:
+            text = main_response
+
+        # IMPROVEMENT 4: Normalize multiple consecutive newlines to max 2
+        text = re.sub(r'\n\n\n+', '\n\n', text)
+
+        return text.strip()
     
     def verify_signature(self, body: bytes, signature: str) -> bool:
         """Verify webhook signature"""
