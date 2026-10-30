@@ -700,10 +700,12 @@ class ZendeskClient:
         )
     
     def add_comment(self, ticket_id: int, comment_text: str, public: bool = True):
-        """Add comment to ticket"""
+        """Add comment to ticket - APPLIES FORMATTING for improved readability"""
         try:
             ticket = self.zenpy_client.tickets(id=ticket_id)
-            ticket.comment = Comment(body=comment_text, public=public)
+            # CRITICAL FIX: Format the comment for better Zendesk readability
+            formatted_comment = self.format_for_zendesk(comment_text)
+            ticket.comment = Comment(body=formatted_comment, public=public)
             self.zenpy_client.tickets.update(ticket)
             logger.info(f":white_check_mark: Added comment to ticket #{ticket_id}")
         except Exception as e:
