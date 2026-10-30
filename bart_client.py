@@ -702,10 +702,10 @@ class ZendeskClient:
     @staticmethod
     def format_for_zendesk(text: str) -> str:
         """
-        EMOJI DECODING + AGGRESSIVE FORMATTING ENHANCEMENT: Clean up HTML entities, convert emoji codes,
-        and dramatically improve spacing for Zendesk readability.
-        ENHANCEMENTS: Pattern-based section detection with visual breaks (---), aggressive header spacing,
-        list formatting, and regression analysis separation to match Slack UI output quality.
+        EMOJI DECODING + AGGRESSIVE HTML FORMATTING ENHANCEMENT: Clean up HTML entities, convert emoji codes,
+        and dramatically improve spacing for Zendesk readability using HTML bold tags for headers.
+        ENHANCEMENTS: Pattern-based section detection with <b>bold headers</b>, aggressive header spacing,
+        list formatting, main title formatting, and regression analysis separation to match Slack UI output quality.
         """
         import html
 
@@ -770,13 +770,13 @@ class ZendeskClient:
                 regression_section = pattern + parts[1]
                 break
 
-        # STEP 2: AGGRESSIVE section header detection and formatting
-        # Use markdown bold (**text**) for headers to ensure Zendesk rendering
+        # STEP 2: AGGRESSIVE section header detection and formatting with HTML
+        # Use HTML bold tags (<b>text</b>) instead of markdown - Zendesk renders HTML better than markdown
         # Pattern 1: "What X does" / "What Y can do" style headers - MOST CRITICAL
-        main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n**\2**\n\n', main_response)
+        main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n<b>\2</b>\n\n', main_response)
 
         # Pattern 2: All caps headers followed by colon: "SECTION:"
-        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n**\2**\n\n', main_response)
+        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n<b>\2</b>\n\n', main_response)
 
         # Pattern 3: Common section headers - "Past similar cases", "Still open:", "Solved or closed", "Closed in", etc.
         common_headers = [
@@ -792,7 +792,11 @@ class ZendeskClient:
             r'Nordea, ticket',
         ]
         for header_pattern in common_headers:
-            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n**\2**\n\n', main_response)
+            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n<b>\2</b>\n\n', main_response)
+
+        # CRITICAL FIX: Format the main title at the beginning if present
+        # Detect title pattern: "Title" or "Title (context)" at start, before first section
+        main_response = re.sub(r'^([A-Z][^\n]+)\n\n', r'<b>\1</b>\n\n', main_response)
 
         # Pattern 4: Add spacing around known major section keywords (Why, Summary, etc.)
         major_keywords = ['Why', 'Summary', 'Recommended', 'Result', 'Example', 'Note', 'Important', 'Status', 'Reference', 'Solution', 'Support-managed', 'Default role']
@@ -915,10 +919,10 @@ class ZendeskWebhookHandler:
     @staticmethod
     def format_for_zendesk(text: str) -> str:
         """
-        EMOJI DECODING + AGGRESSIVE FORMATTING ENHANCEMENT: Clean up HTML entities, convert emoji codes,
-        and dramatically improve spacing for Zendesk readability.
-        ENHANCEMENTS: Pattern-based section detection with visual breaks (---), aggressive header spacing,
-        list formatting, and regression analysis separation to match Slack UI output quality.
+        EMOJI DECODING + AGGRESSIVE HTML FORMATTING ENHANCEMENT: Clean up HTML entities, convert emoji codes,
+        and dramatically improve spacing for Zendesk readability using HTML bold tags for headers.
+        ENHANCEMENTS: Pattern-based section detection with <b>bold headers</b>, aggressive header spacing,
+        list formatting, main title formatting, and regression analysis separation to match Slack UI output quality.
         """
         import html
 
@@ -989,7 +993,7 @@ class ZendeskWebhookHandler:
         main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n---\n\n\2\n\n', main_response)
 
         # Pattern 2: All caps headers followed by colon: "SECTION:"
-        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n**\2**\n\n', main_response)
+        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n<b>\2</b>\n\n', main_response)
 
         # Pattern 3: Common section headers - "Past similar cases", "Still open:", "Solved or closed", "Closed in", etc.
         common_headers = [
@@ -1005,7 +1009,11 @@ class ZendeskWebhookHandler:
             r'Nordea, ticket',
         ]
         for header_pattern in common_headers:
-            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n**\2**\n\n', main_response)
+            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n<b>\2</b>\n\n', main_response)
+
+        # CRITICAL FIX: Format the main title at the beginning if present
+        # Detect title pattern: "Title" or "Title (context)" at start, before first section
+        main_response = re.sub(r'^([A-Z][^\n]+)\n\n', r'<b>\1</b>\n\n', main_response)
 
         # Pattern 4: Add spacing around known major section keywords (Why, Summary, etc.)
         major_keywords = ['Why', 'Summary', 'Recommended', 'Result', 'Example', 'Note', 'Important', 'Status', 'Reference', 'Solution', 'Support-managed', 'Default role']
