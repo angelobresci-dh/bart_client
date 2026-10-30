@@ -784,9 +784,10 @@ class ZendeskWebhookHandler:
     @staticmethod
     def format_for_zendesk(text: str) -> str:
         """
-        EMOJI DECODING + IMPROVED FORMATTING: Clean up HTML entities, convert emoji codes,
-        and improve spacing for better readability in Zendesk comments.
-        IMPROVEMENT: Add proper paragraph spacing, visual breaks, and section formatting.
+        EMOJI DECODING + AGGRESSIVE FORMATTING ENHANCEMENT: Clean up HTML entities, convert emoji codes,
+        and dramatically improve spacing for Zendesk readability.
+        ENHANCEMENTS: Pattern-based section detection with visual breaks (---), aggressive header spacing,
+        list formatting, and regression analysis separation to match Slack UI output quality.
         """
         import html
 
@@ -852,24 +853,42 @@ class ZendeskWebhookHandler:
                 regression_section = pattern + parts[1]
                 break
 
-        # IMPROVEMENT 2: Enhanced formatting for main response
-        # Add proper spacing after numbered items (1., 2., 3., etc.)
-        main_response = re.sub(r'(\d+\.\s+[^\n]+)\n([^\n])', r'\1\n\n\2', main_response)
+        # IMPROVEMENT 2: AGGRESSIVE section header detection and formatting
+        # Pattern 1: "What X does" / "What Y can do" style headers - MOST CRITICAL
+        main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n---\n\n\2\n\n', main_response)
 
-        # Add spacing around section header keywords
-        major_keywords = ['Why', 'Summary', 'Recommended', 'Result', 'Example', 'Note', 'Important', 'Status', 'Reference', 'Solution', 'Support-managed']
+        # Pattern 2: All caps headers followed by colon: "SECTION:"
+        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n---\n\n\2\n\n', main_response)
+
+        # Pattern 3: Common section headers - "Past similar cases", "Still open:", "Solved or closed", "Closed in", etc.
+        common_headers = [
+            r'Past similar cases',
+            r'Still open:?',
+            r'Solved or closed',
+            r'Closed in',
+            r'Proposal for',
+            r'Forward Financing',
+            r'Stepstone',
+            r'Chalhoub',
+            r'Nordea',
+            r'Nordea, ticket',
+        ]
+        for header_pattern in common_headers:
+            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n---\n\n\2\n\n', main_response)
+
+        # Pattern 4: Add spacing around known major section keywords (Why, Summary, etc.)
+        major_keywords = ['Why', 'Summary', 'Recommended', 'Result', 'Example', 'Note', 'Important', 'Status', 'Reference', 'Solution', 'Support-managed', 'Default role']
         for keyword in major_keywords:
-            # Add double newline before keyword headers (e.g., "Why the...")
             main_response = re.sub(rf'([^\n])\n({keyword}[^\n]*:)', r'\1\n\n\2', main_response)
 
-        # Add spacing after colons that end section headers
-        main_response = re.sub(r'([A-Z][a-zA-Z\s]+):\n([^\n])', r'\1:\n\n\2', main_response)
+        # Pattern 5: Add double spacing after colons that end section headers (but not after --- dividers)
+        main_response = re.sub(r'([A-Z][a-zA-Z\s]+):\n([^\-\n])', r'\1:\n\n\2', main_response)
 
-        # Improve list item spacing - ensure double spacing before list items
-        main_response = re.sub(r'([^\n])\n(-\s+[^\n]+)', r'\1\n\n\2', main_response)
+        # Pattern 6: Improve list item spacing - ensure double spacing before dash items
+        main_response = re.sub(r'([^\n-])\n(-\s+[^\n]+)', r'\1\n\n\2', main_response)
 
-        # Add visual breaks between major sections (detect by indent changes or keywords)
-        main_response = re.sub(r'\n\n([A-Z][a-zA-Z\s]+:)\n', r'\n\n---\n\n\1\n', main_response)
+        # Pattern 7: Add spacing after numbered items (1., 2., 3., etc.)
+        main_response = re.sub(r'(\d+\.\s+[^\n]+)\n([^\n\d])', r'\1\n\n\2', main_response)
 
         # IMPROVEMENT 3: Handle regression analysis section separately
         if regression_section:
