@@ -771,11 +771,12 @@ class ZendeskClient:
                 break
 
         # STEP 2: AGGRESSIVE section header detection and formatting
+        # Use markdown bold (**text**) for headers to ensure Zendesk rendering
         # Pattern 1: "What X does" / "What Y can do" style headers - MOST CRITICAL
-        main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n---\n\n\2\n\n', main_response)
+        main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n**\2**\n\n', main_response)
 
         # Pattern 2: All caps headers followed by colon: "SECTION:"
-        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n---\n\n\2\n\n', main_response)
+        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n**\2**\n\n', main_response)
 
         # Pattern 3: Common section headers - "Past similar cases", "Still open:", "Solved or closed", "Closed in", etc.
         common_headers = [
@@ -791,7 +792,7 @@ class ZendeskClient:
             r'Nordea, ticket',
         ]
         for header_pattern in common_headers:
-            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n---\n\n\2\n\n', main_response)
+            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n**\2**\n\n', main_response)
 
         # Pattern 4: Add spacing around known major section keywords (Why, Summary, etc.)
         major_keywords = ['Why', 'Summary', 'Recommended', 'Result', 'Example', 'Note', 'Important', 'Status', 'Reference', 'Solution', 'Support-managed', 'Default role']
@@ -817,8 +818,8 @@ class ZendeskClient:
             # Add proper spacing after colons in regression analysis
             regression_section = re.sub(r'([a-zA-Z]):\n([^\n])', r'\1:\n\n\2', regression_section)
 
-            # Combine with main response using visual break
-            text = main_response + '\n\n---\n\n' + regression_section
+            # Combine with main response using visual separator
+            text = main_response + '\n\n' + regression_section
         else:
             text = main_response
 
@@ -988,7 +989,7 @@ class ZendeskWebhookHandler:
         main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n---\n\n\2\n\n', main_response)
 
         # Pattern 2: All caps headers followed by colon: "SECTION:"
-        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n---\n\n\2\n\n', main_response)
+        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n**\2**\n\n', main_response)
 
         # Pattern 3: Common section headers - "Past similar cases", "Still open:", "Solved or closed", "Closed in", etc.
         common_headers = [
@@ -1004,7 +1005,7 @@ class ZendeskWebhookHandler:
             r'Nordea, ticket',
         ]
         for header_pattern in common_headers:
-            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n---\n\n\2\n\n', main_response)
+            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n**\2**\n\n', main_response)
 
         # Pattern 4: Add spacing around known major section keywords (Why, Summary, etc.)
         major_keywords = ['Why', 'Summary', 'Recommended', 'Result', 'Example', 'Note', 'Important', 'Status', 'Reference', 'Solution', 'Support-managed', 'Default role']
