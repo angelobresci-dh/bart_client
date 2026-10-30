@@ -698,7 +698,135 @@ class ZendeskClient:
             token=token,
             timeout=120
         )
-    
+
+    @staticmethod
+    def format_for_zendesk(text: str) -> str:
+        """
+        EMOJI DECODING + AGGRESSIVE FORMATTING ENHANCEMENT: Clean up HTML entities, convert emoji codes,
+        and dramatically improve spacing for Zendesk readability.
+        ENHANCEMENTS: Pattern-based section detection with visual breaks (---), aggressive header spacing,
+        list formatting, and regression analysis separation to match Slack UI output quality.
+        """
+        import html
+
+        # Decode HTML entities
+        text = html.unescape(text)
+
+        # Convert emoji codes
+        emoji_map = {
+            ':dart:': '🎯',
+            ':books:': '📚',
+            ':ticket:': '🎫',
+            ':studio_microphone:': '🎙️',
+            ':bar_chart:': '📊',
+            ':paperclip:': '📎',
+            ':link:': '🔗',
+            ':wrench:': '🔧',
+            ':warning:': '⚠️',
+            ':bulb:': '💡',
+            ':white_check_mark:': '✅',
+            ':x:': '❌',
+            ':fire:': '🔥',
+            ':robot_face:': '🤖',
+            ':speech_balloon:': '💬',
+            ':football:': '🏈',
+            ':soccer:': '⚽',
+            ':basketball:': '🏀',
+            ':hammer:': '🔨',
+            ':gear:': '⚙️',
+            ':computer:': '💻',
+            ':chart_with_upwards_trend:': '📈',
+            ':calendar:': '📅',
+            ':hourglass_flowing_sand:': '⏳',
+            ':lock:': '🔒',
+            ':unlock:': '🔓',
+            ':red_circle:': '🔴',
+            ':clipboard:': '📋',
+            ':date:': '📅',
+            ':busts_in_silhouette:': '👥',
+            ':bustsinsilhouette:': '👥',
+            ':zap:': '⚡',
+            ':shield:': '🛡️',
+            ':repeat:': '🔁',
+            ':large_yellow_circle:': '🟡',
+            ':large_green_circle:': '🟢',
+            ':largeyellowcircle:': '🟡',
+            ':largegreencircle:': '🟢',
+            ':rotating_light:': '🚨',
+            ':label:': '🏷️',
+        }
+        for code, emoji in emoji_map.items():
+            text = text.replace(code, emoji)
+
+        # STEP 1: Split by regression analysis section FIRST
+        regression_patterns = ['## Regression Analysis', '## REGRESSION ANALYSIS', '## Regression analysis']
+        regression_section = None
+        main_response = text
+
+        for pattern in regression_patterns:
+            if pattern in text:
+                parts = text.split(pattern, 1)
+                main_response = parts[0].rstrip()
+                regression_section = pattern + parts[1]
+                break
+
+        # STEP 2: AGGRESSIVE section header detection and formatting
+        # Pattern 1: "What X does" / "What Y can do" style headers - MOST CRITICAL
+        main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n---\n\n\2\n\n', main_response)
+
+        # Pattern 2: All caps headers followed by colon: "SECTION:"
+        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n---\n\n\2\n\n', main_response)
+
+        # Pattern 3: Common section headers - "Past similar cases", "Still open:", "Solved or closed", "Closed in", etc.
+        common_headers = [
+            r'Past similar cases',
+            r'Still open:?',
+            r'Solved or closed',
+            r'Closed in',
+            r'Proposal for',
+            r'Forward Financing',
+            r'Stepstone',
+            r'Chalhoub',
+            r'Nordea',
+            r'Nordea, ticket',
+        ]
+        for header_pattern in common_headers:
+            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n---\n\n\2\n\n', main_response)
+
+        # Pattern 4: Add spacing around known major section keywords (Why, Summary, etc.)
+        major_keywords = ['Why', 'Summary', 'Recommended', 'Result', 'Example', 'Note', 'Important', 'Status', 'Reference', 'Solution', 'Support-managed', 'Default role']
+        for keyword in major_keywords:
+            main_response = re.sub(rf'([^\n])\n({keyword}[^\n]*:)', r'\1\n\n\2', main_response)
+
+        # Pattern 5: Add double spacing after colons that end section headers (but not after --- dividers)
+        main_response = re.sub(r'([A-Z][a-zA-Z\s]+):\n([^\-\n])', r'\1:\n\n\2', main_response)
+
+        # Pattern 6: Improve list item spacing - ensure double spacing before dash items
+        main_response = re.sub(r'([^\n-])\n(-\s+[^\n]+)', r'\1\n\n\2', main_response)
+
+        # Pattern 7: Add spacing after numbered items (1., 2., 3., etc.)
+        main_response = re.sub(r'(\d+\.\s+[^\n]+)\n([^\n\d])', r'\1\n\n\2', main_response)
+
+        # STEP 3: Handle regression analysis section separately
+        if regression_section:
+            regression_section = regression_section.strip()
+
+            # Add double newline before "Percentage" and "Reasoning"
+            regression_section = re.sub(r'([^\n])\n(Percentage|Reasoning)', r'\1\n\n\2', regression_section)
+
+            # Add proper spacing after colons in regression analysis
+            regression_section = re.sub(r'([a-zA-Z]):\n([^\n])', r'\1:\n\n\2', regression_section)
+
+            # Combine with main response using visual break
+            text = main_response + '\n\n---\n\n' + regression_section
+        else:
+            text = main_response
+
+        # STEP 4: Clean up: collapse excessive newlines (max 2) and remove leading/trailing whitespace
+        text = re.sub(r'\n\n\n+', '\n\n', text)
+
+        return text.strip()
+
     def add_comment(self, ticket_id: int, comment_text: str, public: bool = True):
         """Add comment to ticket - APPLIES FORMATTING for improved readability"""
         try:
