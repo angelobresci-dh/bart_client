@@ -56,6 +56,361 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 
 
+# =============================================================================
+# SLACK -> ZENDESK HTML RENDERING
+# Zendesk treats a comment's `body` as plain text/Markdown, so HTML must be sent
+# in `html_body`. We render Slack's structured `blocks` (the same data Slack
+# uses to draw the message) so bullets, numbering, nesting, bold, code and
+# dividers come through exactly as they appear in Slack.
+# =============================================================================
+import html as _html
+
+EMOJI_MAP = {
+    'dart': '🎯', 'books': '📚', 'ticket': '🎫', 'studio_microphone': '🎙️',
+    'bar_chart': '📊', 'paperclip': '📎', 'link': '🔗', 'wrench': '🔧',
+    'warning': '⚠️', 'bulb': '💡', 'white_check_mark': '✅', 'x': '❌',
+    'fire': '🔥', 'robot_face': '🤖', 'speech_balloon': '💬', 'hammer': '🔨',
+    'gear': '⚙️', 'computer': '💻', 'chart_with_upwards_trend': '📈',
+    'calendar': '📅', 'date': '📅', 'hourglass_flowing_sand': '⏳', 'lock': '🔒',
+    'unlock': '🔓', 'red_circle': '🔴', 'clipboard': '📋', 'busts_in_silhouette': '👥',
+    'zap': '⚡', 'shield': '🛡️', 'repeat': '🔁', 'large_yellow_circle': '🟡',
+    'large_green_circle': '🟢', 'rotating_light': '🚨', 'label': '🏷️',
+    'moneybag': '💰', 'mag': '🔍', 'memo': '📝', 'point_right': '👉',
+    'heavy_check_mark': '✔️', 'arrow_right': '➡️', 'question': '❓',
+}
+
+
+def _esc(text: str) -> str:
+    return _html.escape(text or "", quote=False)
+
+
+def _emoji_from_codes(text: str) -> str:
+    """Replace :emoji_name: codes with unicode where known."""
+    return re.sub(r':([a-z0-9_+\-]+):', lambda m: EMOJI_MAP.get(m.group(1), m.group(0)), text)
+
+
+def _wrap_styles(inner: str, style: Optional[dict]) -> str:
+    if not style:
+        return inner
+    if style.get("code"):
+        inner = f"<code>{inner}</code>"
+    if style.get("italic"):
+        inner = f"<em>{inner}</em>"
+    if style.get("bold"):
+        inner = f"<strong>{inner}</strong>"
+    if style.get("strike"):
+        inner = f"<del>{inner}</del>"
+    return inner
+
+
+def _styled(text_html: str, style: Optional[dict]) -> str:
+    """Apply styles per line so tags never span a paragraph break."""
+    if not style:
+        return text_html
+    return "\n".join(_wrap_styles(seg, style) if seg.strip() else seg
+                     for seg in text_html.split("\n"))
+
+
+def _render_inline_elements(elements: list, preformatted: bool = False) -> str:
+    """Render rich_text inline elements (text, link, emoji, user...) to HTML.
+    Newlines are kept as '\\n' for the caller to turn into <p>/<br>."""
+    out = []
+    for el in elements or []:
+        t = el.get("type")
+        style = None if preformatted else el.get("style")
+        if t == "text":
+            out.append(_styled(_esc(el.get("text", "")), style))
+        elif t == "link":
+            url = el.get("url", "")
+            label = _esc(el.get("text") or url)
+            if preformatted:
+                out.append(label)
+            else:
+                out.append(_styled(f'<a href="{_html.escape(url, quote=True)}">{label}</a>', style))
+        elif t == "emoji":
+            uni = el.get("unicode")
+            if uni:
+                try:
+                    out.append("".join(chr(int(cp, 16)) for cp in uni.split("-")))
+                    continue
+                except ValueError:
+                    pass
+            name = el.get("name", "")
+            out.append(EMOJI_MAP.get(name, f":{name}:"))
+        elif t == "user":
+            out.append(f"@{_esc(el.get('user_id', 'user'))}")
+        elif t == "usergroup":
+            out.append(f"@{_esc(el.get('usergroup_id', 'group'))}")
+        elif t == "channel":
+            out.append(f"#{_esc(el.get('channel_id', 'channel'))}")
+        elif t == "broadcast":
+            out.append(f"@{_esc(el.get('range', 'here'))}")
+        elif t == "date":
+            out.append(_esc(el.get("fallback", "")))
+        elif el.get("text"):
+            out.append(_esc(el.get("text")))
+    return "".join(out)
+
+
+def _paragraphs(inline_html: str) -> str:
+    """Turn inline HTML containing '\\n' into <p> blocks with <br> line breaks."""
+    inline_html = inline_html.strip("\n")
+    if not inline_html.strip():
+        return ""
+    paras = [p for p in re.split(r'\n{2,}', inline_html) if p.strip()]
+    return "".join(f"<p>{p.strip(chr(10)).replace(chr(10), '<br>')}</p>" for p in paras)
+
+
+def _render_rich_text(block: dict) -> str:
+    """Render a Slack rich_text block, including nested bullet/ordered lists."""
+    out = []
+    stack = []  # one dict per open list level: {"tag": "ul"/"ol", "li_open": bool}
+
+    def close_to(level: int):
+        while len(stack) > level:
+            entry = stack.pop()
+            if entry["li_open"]:
+                out.append("</li>")
+            out.append(f"</{entry['tag']}>")
+
+    for el in block.get("elements", []):
+        t = el.get("type")
+        if t == "rich_text_list":
+            indent = int(el.get("indent", 0) or 0)
+            tag = "ol" if el.get("style") == "ordered" else "ul"
+            close_to(indent + 1)
+            if len(stack) == indent + 1 and stack[-1]["tag"] != tag:
+                close_to(indent)
+            while len(stack) < indent + 1:
+                attrs = ""
+                if tag == "ol" and len(stack) == indent and el.get("offset"):
+                    attrs = f' start="{int(el["offset"]) + 1}"'
+                out.append(f"<{tag}{attrs}>")
+                stack.append({"tag": tag if len(stack) == indent else "ul", "li_open": False})
+            level = stack[-1]
+            for item in el.get("elements", []):
+                if level["li_open"]:
+                    out.append("</li>")
+                item_html = _render_inline_elements(item.get("elements", [])).strip("\n")
+                out.append("<li>" + item_html.replace("\n", "<br>"))
+                level["li_open"] = True
+            continue
+
+        close_to(0)
+        if t == "rich_text_section":
+            out.append(_paragraphs(_render_inline_elements(el.get("elements", []))))
+        elif t == "rich_text_preformatted":
+            code = _render_inline_elements(el.get("elements", []), preformatted=True)
+            out.append(f"<pre><code>{code.strip(chr(10))}</code></pre>")
+        elif t == "rich_text_quote":
+            out.append(f"<blockquote>{_paragraphs(_render_inline_elements(el.get('elements', [])))}</blockquote>")
+    close_to(0)
+    return "".join(out)
+
+
+def _mrkdwn_inline(text: str, flavor: str = "mrkdwn") -> str:
+    """Convert one line of Slack mrkdwn / Markdown to inline HTML."""
+    tokens = []
+
+    def keep(fragment: str) -> str:
+        tokens.append(fragment)
+        return f"\x00{len(tokens) - 1}\x00"
+
+    # Code spans first so nothing inside them is touched
+    text = re.sub(r'`([^`\n]+)`', lambda m: keep(f"<code>{_esc(m.group(1))}</code>"), text)
+    # Slack links <url|label>, mentions, specials
+    def slack_link(m):
+        target, label = m.group(1), m.group(2)
+        if target.startswith("@"):
+            return keep(_esc(label or target))
+        if target.startswith("#"):
+            return keep("#" + _esc(label or target[1:]))
+        if target.startswith("!"):
+            return keep("@" + _esc((label or target[1:]).split("^")[0]))
+        return keep(f'<a href="{_html.escape(target, quote=True)}">{_esc(label or target)}</a>')
+    text = re.sub(r'<((?:https?://|mailto:|@|#|!)[^|>\s]+)(?:\|([^>]+))?>', slack_link, text)
+    # Markdown links [label](url)
+    text = re.sub(r'\[([^\]]+)\]\((https?://[^)\s]+)\)',
+                  lambda m: keep(f'<a href="{_html.escape(m.group(2), quote=True)}">{_esc(m.group(1))}</a>'), text)
+
+    text = _esc(text)
+    text = re.sub(r'\*\*(?=\S)(.+?)(?<=\S)\*\*', r'<strong>\1</strong>', text)
+    if flavor == "markdown":
+        text = re.sub(r'(?<![\w*])\*(?=\S)(.+?)(?<=\S)\*(?![\w*])', r'<em>\1</em>', text)
+        text = re.sub(r'(?<!\w)__(?=\S)(.+?)(?<=\S)__(?!\w)', r'<strong>\1</strong>', text)
+    else:
+        text = re.sub(r'(?<![\w*])\*(?=\S)(.+?)(?<=\S)\*(?![\w*])', r'<strong>\1</strong>', text)
+    text = re.sub(r'(?<![\w_])_(?=\S)(.+?)(?<=\S)_(?![\w_])', r'<em>\1</em>', text)
+    text = re.sub(r'(?<![\w~])~~?(?=\S)(.+?)(?<=\S)~~?(?![\w~])', r'<del>\1</del>', text)
+    text = _emoji_from_codes(text)
+    return re.sub(r'\x00(\d+)\x00', lambda m: tokens[int(m.group(1))], text)
+
+
+def mrkdwn_to_html(text: str, flavor: str = "mrkdwn") -> str:
+    """Convert Slack mrkdwn or Markdown text (with bullets, numbers, code blocks,
+    quotes, dividers and tables) into Zendesk-ready HTML. Used when a message
+    has no rich_text blocks."""
+    text = _html.unescape(text or "").replace("\r\n", "\n")
+    lines = text.split("\n")
+    out, para = [], []
+    list_stack = []  # entries: {"tag", "width", "li_open"}
+
+    def flush_para():
+        if para:
+            out.append("<p>" + "<br>".join(para) + "</p>")
+            para.clear()
+
+    def close_lists(to_len: int = 0):
+        while len(list_stack) > to_len:
+            entry = list_stack.pop()
+            if entry["li_open"]:
+                out.append("</li>")
+            out.append(f"</{entry['tag']}>")
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
+        stripped = raw.strip()
+
+        if stripped.startswith("```"):
+            flush_para(); close_lists()
+            code_lines = [stripped[3:]] if stripped[3:] and not stripped.endswith("```") else []
+            if stripped.endswith("```") and len(stripped) > 6:
+                code_lines = [stripped[3:-3]]
+            else:
+                i += 1
+                while i < len(lines) and not lines[i].strip().startswith("```"):
+                    code_lines.append(lines[i])
+                    i += 1
+            out.append("<pre><code>" + _esc("\n".join(code_lines)) + "</code></pre>")
+            i += 1
+            continue
+
+        if not stripped:
+            flush_para(); close_lists()
+            i += 1
+            continue
+
+        if re.fullmatch(r'(-{3,}|\*{3,}|_{3,}|[─━—]{3,})', stripped):
+            flush_para(); close_lists()
+            out.append("<hr>")
+            i += 1
+            continue
+
+        heading = re.match(r'^(#{1,6})\s+(.*)$', stripped)
+        if heading:
+            flush_para(); close_lists()
+            level = min(len(heading.group(1)) + 2, 6)
+            out.append(f"<h{level}>{_mrkdwn_inline(heading.group(2), flavor)}</h{level}>")
+            i += 1
+            continue
+
+        if stripped.startswith("|") and stripped.endswith("|"):
+            flush_para(); close_lists()
+            rows = []
+            while i < len(lines) and lines[i].strip().startswith("|") and lines[i].strip().endswith("|"):
+                rows.append([c.strip() for c in lines[i].strip()[1:-1].split("|")])
+                i += 1
+            rows = [r for r in rows if not all(re.fullmatch(r':?-{2,}:?', c or '-') for c in r)]
+            if rows:
+                head, body = rows[0], rows[1:]
+                html_rows = "<tr>" + "".join(f"<th>{_mrkdwn_inline(c, flavor)}</th>" for c in head) + "</tr>"
+                html_rows += "".join("<tr>" + "".join(f"<td>{_mrkdwn_inline(c, flavor)}</td>" for c in r) + "</tr>" for r in body)
+                out.append(f"<table>{html_rows}</table>")
+            continue
+
+        if stripped.startswith(">"):
+            flush_para(); close_lists()
+            quote = []
+            while i < len(lines) and lines[i].strip().startswith(">"):
+                quote.append(_mrkdwn_inline(lines[i].strip()[1:].lstrip(), flavor))
+                i += 1
+            out.append("<blockquote><p>" + "<br>".join(quote) + "</p></blockquote>")
+            continue
+
+        item = re.match(r'^(\s*)(?:([-*•◦▪‣])|(\d+)[.)])\s+(.*)$', raw.replace("\t", "    "))
+        if item:
+            flush_para()
+            width = len(item.group(1))
+            tag = "ol" if item.group(3) else "ul"
+            # Pop levels deeper than this item
+            while list_stack and list_stack[-1]["width"] > width:
+                close_lists(len(list_stack) - 1)
+            if list_stack and list_stack[-1]["width"] == width and list_stack[-1]["tag"] != tag:
+                close_lists(len(list_stack) - 1)
+            if not list_stack or list_stack[-1]["width"] < width:
+                start = ""
+                if tag == "ol" and item.group(3) and item.group(3) != "1":
+                    start = f' start="{item.group(3)}"'
+                out.append(f"<{tag}{start}>")
+                list_stack.append({"tag": tag, "width": width, "li_open": False})
+            level = list_stack[-1]
+            if level["li_open"]:
+                out.append("</li>")
+            out.append("<li>" + _mrkdwn_inline(item.group(4), flavor))
+            level["li_open"] = True
+            i += 1
+            continue
+
+        # Indented continuation of a list item
+        if list_stack and raw[:1].isspace():
+            out.append("<br>" + _mrkdwn_inline(stripped, flavor))
+            i += 1
+            continue
+
+        close_lists()
+        para.append(_mrkdwn_inline(stripped, flavor))
+        i += 1
+
+    flush_para(); close_lists()
+    return "".join(out)
+
+
+def slack_blocks_to_html(blocks: Optional[list]) -> str:
+    """Render a Slack message's blocks to HTML. Returns '' if nothing renderable.
+    Context blocks (cost / model footers) are skipped on purpose."""
+    out = []
+    for block in blocks or []:
+        t = block.get("type")
+        if t == "rich_text":
+            out.append(_render_rich_text(block))
+        elif t == "divider":
+            out.append("<hr>")
+        elif t == "header":
+            out.append(f"<h3>{_esc((block.get('text') or {}).get('text', ''))}</h3>")
+        elif t == "markdown":
+            out.append(mrkdwn_to_html(block.get("text", ""), flavor="markdown"))
+        elif t == "section":
+            txt = block.get("text") or {}
+            if txt.get("text"):
+                if txt.get("type") == "plain_text":
+                    out.append(_paragraphs(_esc(txt["text"])))
+                else:
+                    out.append(mrkdwn_to_html(txt["text"]))
+            for field in block.get("fields", []) or []:
+                out.append(mrkdwn_to_html(field.get("text", "")))
+    return "".join(p for p in out if p)
+
+
+def slack_message_to_html(text: str, blocks: Optional[list]) -> str:
+    """Prefer structured blocks; fall back to converting the message text."""
+    rendered = ""
+    try:
+        rendered = slack_blocks_to_html(blocks)
+    except Exception as e:
+        logger.warning(f":warning: Failed to render Slack blocks to HTML, using text: {e}")
+    return rendered if rendered.strip() else mrkdwn_to_html(text)
+
+
+def build_zendesk_html_comment(body_html: str, title: str, footer: str,
+                               slack_url: str = "", slack_label: str = "View conversation in Slack") -> str:
+    """Wrap Bart's rendered answer with the header, divider and footer."""
+    parts = [f"<p><strong>{_esc(title)}</strong></p>", body_html, "<hr>", f"<p><em>{_esc(footer)}</em></p>"]
+    if slack_url:
+        parts.append(f'<p>💬 <a href="{_html.escape(slack_url, quote=True)}">{_esc(slack_label)}</a></p>')
+    return "".join(parts)
+
+
 class BartClient:
     """Async Bart client using WebSocket (Socket Mode) with smart message collection"""
     BART_USER_ID = "U09RYUJDUQL"
@@ -259,6 +614,8 @@ class BartClient:
             is_final = self.is_final_message(text)
             log.info(f"   Classification: is_working={is_working}, is_final={is_final}, length={len(text)}")
             
+            msg_blocks = msg_obj.get("blocks") or []
+
             if is_edit:
                 messages = self.pending_responses[thread_ts]["messages"]
                 existing_idx = None
@@ -266,10 +623,11 @@ class BartClient:
                     if msg["ts"] == ts:
                         existing_idx = idx
                         break
-                
+
                 if existing_idx is not None:
                     messages[existing_idx] = {
                         "text": text,
+                        "blocks": msg_blocks,
                         "ts": ts,
                         "is_working": is_working,
                         "is_final": is_final
@@ -278,6 +636,7 @@ class BartClient:
                 else:
                     self.pending_responses[thread_ts]["messages"].append({
                         "text": text,
+                        "blocks": msg_blocks,
                         "ts": ts,
                         "is_working": is_working,
                         "is_final": is_final
@@ -285,6 +644,7 @@ class BartClient:
             else:
                 self.pending_responses[thread_ts]["messages"].append({
                     "text": text,
+                    "blocks": msg_blocks,
                     "ts": ts,
                     "is_working": is_working,
                     "is_final": is_final
@@ -373,6 +733,7 @@ class BartClient:
                                     logger.info(f":arrows_counterclockwise: [{request_id}] Updated message via polling (ts: {ts}, is_final={is_final}, length={len(text)})")
                                     messages[existing_idx] = {
                                         "text": text,
+                                        "blocks": msg.get("blocks") or [],
                                         "ts": ts,
                                         "is_working": is_working,
                                         "is_final": is_final
@@ -383,6 +744,7 @@ class BartClient:
                                 logger.info(f":arrows_counterclockwise: [{request_id}] Found new message via polling (ts: {ts}, is_final={is_final}, length={len(text)})")
                                 messages.append({
                                     "text": text,
+                                    "blocks": msg.get("blocks") or [],
                                     "ts": ts,
                                     "is_working": is_working,
                                     "is_final": is_final
@@ -411,27 +773,34 @@ class BartClient:
             
             await asyncio.sleep(2)
     
-    def concatenate_messages(self, thread_ts: str) -> str:
-        """Concatenate all final messages from Bart"""
+    def _select_response_messages(self, thread_ts: str) -> list:
+        """Pick Bart's final messages (or the meaningful ones if none are marked final)."""
         request_id = self.pending_responses[thread_ts].get("request_id", "unknown")
         messages = self.pending_responses[thread_ts]["messages"]
-        
+
         final_messages = [msg for msg in messages if msg["is_final"]]
-        
         if final_messages:
             final_messages.sort(key=lambda m: m["ts"])
-            texts = [msg["text"] for msg in final_messages]
             logger.info(f":clipboard: [{request_id}] Concatenated {len(final_messages)} FINAL messages")
-            return "\n\n".join(texts)
-        
+            return final_messages
+
         meaningful_messages = [msg for msg in messages if not msg["is_working"]]
         if not meaningful_messages:
-            meaningful_messages = messages
-        
+            meaningful_messages = list(messages)
         meaningful_messages.sort(key=lambda m: m["ts"])
-        texts = [msg["text"] for msg in meaningful_messages]
         logger.info(f":clipboard: [{request_id}] Concatenated {len(meaningful_messages)} messages")
-        return "\n\n".join(texts)
+        return meaningful_messages
+
+    def concatenate_messages(self, thread_ts: str) -> str:
+        """Concatenate all final messages from Bart (plain text)"""
+        return "\n\n".join(msg["text"] for msg in self._select_response_messages(thread_ts))
+
+    def concatenate_messages_html(self, thread_ts: str) -> str:
+        """Render the same messages to HTML from their Slack blocks, for Zendesk"""
+        return "".join(
+            slack_message_to_html(msg["text"], msg.get("blocks"))
+            for msg in self._select_response_messages(thread_ts)
+        )
     
     async def _post_question(self, question: str, ticket_id: int, zendesk_subdomain: str, request_id: str) -> str:
         """Post question to Slack"""
@@ -649,6 +1018,7 @@ class BartClient:
                             
                             self.pending_responses[message_ts]["messages"].append({
                                 "text": text,
+                                "blocks": msg.get("blocks") or [],
                                 "ts": ts,
                                 "is_working": is_working,
                                 "is_final": is_final
@@ -673,9 +1043,15 @@ class BartClient:
                     thread_url = ""
                 
                 complete_response = self.concatenate_messages(message_ts)
-                
+                try:
+                    complete_response_html = self.concatenate_messages_html(message_ts)
+                except Exception as e:
+                    logger.warning(f":warning: [{request_id}] HTML rendering failed, falling back to text: {e}")
+                    complete_response_html = mrkdwn_to_html(complete_response)
+
                 return {
                     "response": complete_response,
+                    "response_html": complete_response_html,
                     "ticket_id": self.pending_responses[message_ts]["ticket_id"],
                     "slack_thread_url": thread_url
                 }
@@ -699,138 +1075,20 @@ class ZendeskClient:
             timeout=120
         )
 
-    @staticmethod
-    def format_for_zendesk(text: str) -> str:
-        """
-        COMPREHENSIVE HTML FORMATTING: Convert plain text response to rich HTML with proper
-        list rendering, section headers, horizontal rules, and code formatting.
-        Outputs HTML that renders like Slack in Zendesk's rich text editor.
-        """
-        import html as html_module
-
-        # Decode HTML entities
-        text = html_module.unescape(text)
-
-        # Convert emoji codes
-        emoji_map = {
-            ':dart:': '🎯', ':books:': '📚', ':ticket:': '🎫', ':studio_microphone:': '🎙️',
-            ':bar_chart:': '📊', ':paperclip:': '📎', ':link:': '🔗', ':wrench:': '🔧',
-            ':warning:': '⚠️', ':bulb:': '💡', ':white_check_mark:': '✅', ':x:': '❌',
-            ':fire:': '🔥', ':robot_face:': '🤖', ':speech_balloon:': '💬', ':football:': '🏈',
-            ':soccer:': '⚽', ':basketball:': '🏀', ':hammer:': '🔨', ':gear:': '⚙️',
-            ':computer:': '💻', ':chart_with_upwards_trend:': '📈', ':calendar:': '📅',
-            ':hourglass_flowing_sand:': '⏳', ':lock:': '🔒', ':unlock:': '🔓', ':red_circle:': '🔴',
-            ':clipboard:': '📋', ':date:': '📅', ':busts_in_silhouette:': '👥', ':bustsinsilhouette:': '👥',
-            ':zap:': '⚡', ':shield:': '🛡️', ':repeat:': '🔁', ':large_yellow_circle:': '🟡',
-            ':large_green_circle:': '🟢', ':largeyellowcircle:': '🟡', ':largegreencircle:': '🟢',
-            ':rotating_light:': '🚨', ':label:': '🏷️',
-        }
-        for code, emoji in emoji_map.items():
-            text = text.replace(code, emoji)
-
-        # Split text into lines for processing
-        lines = text.split('\n')
-        html_output = []
-        i = 0
-
-        while i < len(lines):
-            line = lines[i].rstrip()
-
-            # Skip empty lines but track them for spacing
-            if not line:
-                i += 1
-                continue
-
-            # Detect section headers and wrap in bold
-            if line and not line.startswith(('- ', '• ', '* ')) and not re.match(r'^\d+\.\s', line):
-                # Check if this looks like a section header
-                if any(line.strip().endswith(':') for _ in [1]) or line in [
-                    'Main response', 'What the code does', 'What the customer can do',
-                    'Past issues', 'Past cases', 'Past similar cases', 'Proposed change',
-                    'Proposed change for Support', 'Second section: regression analysis',
-                    'Options for the customer', 'Still open', 'Solved or closed',
-                    'Closed in Linear', 'Related references', 'Corrections to the earlier answer'
-                ] or re.match(r'^(What|Past|Proposed|Closed|Still|Solved|Related|Open|Second)', line):
-                    # This is a section header
-                    html_output.append(f'<b>{html_module.escape(line)}</b>')
-                    html_output.append('')  # spacing
-                elif line == '---' or line.startswith('---'):
-                    # Horizontal rule
-                    html_output.append('<hr />')
-                else:
-                    # Regular paragraph text
-                    # Escape HTML but preserve backtick code formatting
-                    escaped_line = html_module.escape(line)
-                    # Convert `code` to <code>code</code>
-                    escaped_line = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped_line)
-                    html_output.append(escaped_line)
-
-            # Detect bullet lists
-            elif line.startswith(('- ', '• ', '* ')):
-                # Collect all bullet items in this list
-                bullet_items = []
-                while i < len(lines):
-                    curr = lines[i].rstrip()
-                    if curr.startswith(('- ', '• ', '* ')):
-                        # Remove the bullet marker and get the content
-                        item_text = re.sub(r'^[-•*]\s+', '', curr)
-                        escaped_item = html_module.escape(item_text)
-                        # Convert `code` to <code>code</code>
-                        escaped_item = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped_item)
-                        bullet_items.append(f'<li>{escaped_item}</li>')
-                        i += 1
-                    else:
-                        break
-
-                if bullet_items:
-                    html_output.append('<ul>')
-                    html_output.extend(bullet_items)
-                    html_output.append('</ul>')
-                    html_output.append('')  # spacing
-                continue
-
-            # Detect numbered lists
-            elif re.match(r'^\d+\.\s', line):
-                # Collect all numbered items in this list
-                numbered_items = []
-                while i < len(lines):
-                    curr = lines[i].rstrip()
-                    if re.match(r'^\d+\.\s', curr):
-                        # Remove the number marker and get the content
-                        item_text = re.sub(r'^\d+\.\s+', '', curr)
-                        escaped_item = html_module.escape(item_text)
-                        # Convert `code` to <code>code</code>
-                        escaped_item = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped_item)
-                        numbered_items.append(f'<li>{escaped_item}</li>')
-                        i += 1
-                    else:
-                        break
-
-                if numbered_items:
-                    html_output.append('<ol>')
-                    html_output.extend(numbered_items)
-                    html_output.append('</ol>')
-                    html_output.append('')  # spacing
-                continue
-
-            i += 1
-
-        # Join with line breaks and clean up
-        result = '\n'.join(html_output)
-        # Remove excessive spacing
-        result = re.sub(r'\n\n\n+', '\n\n', result)
-
-        return result.strip()
-
-    def add_comment(self, ticket_id: int, comment_text: str, public: bool = True):
-        """Add comment to ticket - APPLIES FORMATTING for improved readability"""
+    def add_comment(self, ticket_id: int, comment_text: str, public: bool = True,
+                    html_body: Optional[str] = None):
+        """Add a comment to a ticket.
+        If html_body is given it is sent as Zendesk `html_body` (rendered as rich text:
+        bold, lists, code, horizontal rules). Otherwise comment_text is sent as `body`."""
         try:
             ticket = self.zenpy_client.tickets(id=ticket_id)
-            # CRITICAL FIX: Format the comment for better Zendesk readability
-            formatted_comment = ZendeskClient.format_for_zendesk(comment_text)
-            ticket.comment = Comment(body=formatted_comment, public=public)
+            if html_body:
+                ticket.comment = Comment(html_body=html_body, public=public)
+            else:
+                ticket.comment = Comment(body=comment_text, public=public)
             self.zenpy_client.tickets.update(ticket)
-            logger.info(f":white_check_mark: Added comment to ticket #{ticket_id}")
+            logger.info(f":white_check_mark: Added comment to ticket #{ticket_id}"
+                        f" ({'html_body' if html_body else 'body'})")
         except Exception as e:
             logger.error(f":x: Failed to update ticket #{ticket_id}: {e}")
             raise
@@ -908,150 +1166,9 @@ class ZendeskWebhookHandler:
     
     @staticmethod
     def format_for_zendesk(text: str) -> str:
-        """
-        EMOJI DECODING + SPACING ENHANCEMENT: Clean up HTML entities, convert emoji codes,
-        and improve spacing for Zendesk readability using horizontal rule separators.
-        ENHANCEMENTS: Pattern-based section detection with --- horizontal rules between sections,
-        aggressive header spacing, list formatting preservation, and regression analysis separation.
-        """
-        import html
-
-        # Decode HTML entities
-        text = html.unescape(text)
-
-        # Convert emoji codes
-        emoji_map = {
-            ':dart:': '🎯',
-            ':books:': '📚',
-            ':ticket:': '🎫',
-            ':studio_microphone:': '🎙️',
-            ':bar_chart:': '📊',
-            ':paperclip:': '📎',
-            ':link:': '🔗',
-            ':wrench:': '🔧',
-            ':warning:': '⚠️',
-            ':bulb:': '💡',
-            ':white_check_mark:': '✅',
-            ':x:': '❌',
-            ':fire:': '🔥',
-            ':robot_face:': '🤖',
-            ':speech_balloon:': '💬',
-            ':football:': '🏈',
-            ':soccer:': '⚽',
-            ':basketball:': '🏀',
-            ':hammer:': '🔨',
-            ':gear:': '⚙️',
-            ':computer:': '💻',
-            ':chart_with_upwards_trend:': '📈',
-            ':calendar:': '📅',
-            ':hourglass_flowing_sand:': '⏳',
-            ':lock:': '🔒',
-            ':unlock:': '🔓',
-            ':red_circle:': '🔴',
-            ':clipboard:': '📋',
-            ':date:': '📅',
-            ':busts_in_silhouette:': '👥',
-            ':bustsinsilhouette:': '👥',
-            ':zap:': '⚡',
-            ':shield:': '🛡️',
-            ':repeat:': '🔁',
-            ':large_yellow_circle:': '🟡',
-            ':large_green_circle:': '🟢',
-            ':largeyellowcircle:': '🟡',
-            ':largegreencircle:': '🟢',
-            ':rotating_light:': '🚨',
-            ':label:': '🏷️',
-        }
-        for code, emoji in emoji_map.items():
-            text = text.replace(code, emoji)
-
-        # Split text into lines for HTML processing
-        lines = text.split('\n')
-        html_output = []
-        i = 0
-
-        while i < len(lines):
-            line = lines[i].rstrip()
-
-            # Skip empty lines
-            if not line:
-                i += 1
-                continue
-
-            # Detect section headers and wrap in bold
-            if line and not line.startswith(('- ', '• ', '* ')) and not re.match(r'^\d+\.\s', line):
-                # Check if this looks like a section header
-                if any(line.strip().endswith(':') for _ in [1]) or line in [
-                    'Main response', 'What the code does', 'What the customer can do',
-                    'Past issues', 'Past cases', 'Past similar cases', 'Proposed change',
-                    'Proposed change for Support', 'Second section: regression analysis',
-                    'Options for the customer', 'Still open', 'Solved or closed',
-                    'Closed in Linear', 'Related references', 'Corrections to the earlier answer'
-                ] or re.match(r'^(What|Past|Proposed|Closed|Still|Solved|Related|Open|Second)', line):
-                    # Section header
-                    import html as html_module
-                    html_output.append(f'<b>{html_module.escape(line)}</b>')
-                    html_output.append('')
-                elif line == '---' or line.startswith('---'):
-                    html_output.append('<hr />')
-                else:
-                    # Regular paragraph
-                    import html as html_module
-                    escaped_line = html_module.escape(line)
-                    escaped_line = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped_line)
-                    html_output.append(escaped_line)
-
-            # Detect bullet lists
-            elif line.startswith(('- ', '• ', '* ')):
-                bullet_items = []
-                while i < len(lines):
-                    curr = lines[i].rstrip()
-                    if curr.startswith(('- ', '• ', '* ')):
-                        item_text = re.sub(r'^[-•*]\s+', '', curr)
-                        import html as html_module
-                        escaped_item = html_module.escape(item_text)
-                        escaped_item = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped_item)
-                        bullet_items.append(f'<li>{escaped_item}</li>')
-                        i += 1
-                    else:
-                        break
-
-                if bullet_items:
-                    html_output.append('<ul>')
-                    html_output.extend(bullet_items)
-                    html_output.append('</ul>')
-                    html_output.append('')
-                continue
-
-            # Detect numbered lists
-            elif re.match(r'^\d+\.\s', line):
-                numbered_items = []
-                while i < len(lines):
-                    curr = lines[i].rstrip()
-                    if re.match(r'^\d+\.\s', curr):
-                        item_text = re.sub(r'^\d+\.\s+', '', curr)
-                        import html as html_module
-                        escaped_item = html_module.escape(item_text)
-                        escaped_item = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped_item)
-                        numbered_items.append(f'<li>{escaped_item}</li>')
-                        i += 1
-                    else:
-                        break
-
-                if numbered_items:
-                    html_output.append('<ol>')
-                    html_output.extend(numbered_items)
-                    html_output.append('</ol>')
-                    html_output.append('')
-                continue
-
-            i += 1
-
-        # Join and clean up
-        result = '\n'.join(html_output)
-        result = re.sub(r'\n\n\n+', '\n\n', result)
-
-        return result.strip()
+        """Plain-text cleanup (HTML entities + emoji codes) for API responses and logs.
+        Zendesk comments are rendered separately as HTML via build_zendesk_html_comment()."""
+        return _emoji_from_codes(_html.unescape(text or "")).strip()
     
     def verify_signature(self, body: bytes, signature: str) -> bool:
         """Verify webhook signature"""
@@ -1207,19 +1324,26 @@ Instructions and rules for your response:
             logger.info(f":white_check_mark: [{request_id}] Response is for ticket #{response_ticket_id}")
             logger.info(f":mag: [{request_id}] Response content preview: {bart_response[:300]}...")
             
-            # EMOJI DECODING: Apply formatting cleanup
+            # Plain-text version (API response / fallback)
             cleaned_response = self.format_for_zendesk(bart_response)
-            
-            formatted_response = (
-                f"🤖 **Bart's Response:**\n\n"
-                f"{cleaned_response}\n\n"
-                f"---\n"
-                f"_This response was automatically generated by Bart, DataHub's code archaeology expert. "
-                f"Response generated at {datetime.now(timezone.utc).isoformat()}Z_"
+            footer_text = (
+                f"This response was automatically generated by Bart, DataHub's code archaeology expert. "
+                f"Response generated at {datetime.now(timezone.utc).isoformat()}Z"
             )
-            
+            formatted_response = (
+                f"🤖 Bart's Response:\n\n{cleaned_response}\n\n---\n{footer_text}"
+            )
             if slack_thread_url:
-                formatted_response += f"\n\n💬 [View conversation in Slack]({slack_thread_url})"
+                formatted_response += f"\n\n💬 View conversation in Slack: {slack_thread_url}"
+
+            # HTML version for Zendesk (rendered from Slack blocks, like the Slack UI)
+            response_html = result.get("response_html") or mrkdwn_to_html(bart_response)
+            formatted_html = build_zendesk_html_comment(
+                response_html,
+                title="🤖 Bart's Response:",
+                footer=footer_text,
+                slack_url=slack_thread_url,
+            )
             
             # NEW: Track comment success and tag addition
             comment_added = False
@@ -1229,7 +1353,8 @@ Instructions and rules for your response:
                 # Use response_ticket_id to ensure we post to the correct ticket
                 logger.info(f":memo: [{request_id}] Adding comment to ticket #{response_ticket_id}")
                 try:
-                    self.zendesk.add_comment(ticket_id=response_ticket_id, comment_text=formatted_response, public=False)
+                    self.zendesk.add_comment(ticket_id=response_ticket_id, comment_text=formatted_response,
+                                             public=False, html_body=formatted_html)
                     comment_added = True
                     
                     # ONLY tag the ticket after successfully posting the comment
@@ -1773,11 +1898,19 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
                     if response_ticket_id and response_ticket_id != 99999 and add_comment:
                         try:
                             cleaned = webhook_handler.format_for_zendesk(response)
-                            formatted = f"🤖 **Bart's Response (Test):**\n\n{cleaned}\n\n---\n_Test response_"
+                            formatted = f"🤖 Bart's Response (Test):\n\n{cleaned}\n\n---\nTest response"
                             if slack_thread_url:
-                                formatted += f"\n\n💬 [View in Slack]({slack_thread_url})"
+                                formatted += f"\n\n💬 View in Slack: {slack_thread_url}"
+                            formatted_html = build_zendesk_html_comment(
+                                result.get("response_html") or mrkdwn_to_html(response),
+                                title="🤖 Bart's Response (Test):",
+                                footer="Test response",
+                                slack_url=slack_thread_url,
+                                slack_label="View in Slack",
+                            )
                             logger.info(f":memo: Posting test comment to ticket #{response_ticket_id}")
-                            zendesk_client.add_comment(response_ticket_id, formatted, public=False)
+                            zendesk_client.add_comment(response_ticket_id, formatted, public=False,
+                                                       html_body=formatted_html)
                             comment_added = True
                             
                             # Add tag after successful comment
@@ -1842,11 +1975,19 @@ async def test_bart_question(request: Request, background_tasks: BackgroundTasks
         if response_ticket_id and response_ticket_id != 99999 and add_comment:
             try:
                 cleaned = webhook_handler.format_for_zendesk(response)
-                formatted = f"🤖 **Bart's Response (Test):**\n\n{cleaned}\n\n---\n_Test response_"
+                formatted = f"🤖 Bart's Response (Test):\n\n{cleaned}\n\n---\nTest response"
                 if slack_thread_url:
-                    formatted += f"\n\n💬 [View in Slack]({slack_thread_url})"
+                    formatted += f"\n\n💬 View in Slack: {slack_thread_url}"
+                formatted_html = build_zendesk_html_comment(
+                    result.get("response_html") or mrkdwn_to_html(response),
+                    title="🤖 Bart's Response (Test):",
+                    footer="Test response",
+                    slack_url=slack_thread_url,
+                    slack_label="View in Slack",
+                )
                 logger.info(f":memo: Posting test comment to ticket #{response_ticket_id}")
-                zendesk_client.add_comment(response_ticket_id, formatted, public=False)
+                zendesk_client.add_comment(response_ticket_id, formatted, public=False,
+                                           html_body=formatted_html)
                 comment_added = True
                 
                 # Add tag after successful comment
