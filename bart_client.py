@@ -702,10 +702,10 @@ class ZendeskClient:
     @staticmethod
     def format_for_zendesk(text: str) -> str:
         """
-        EMOJI DECODING + AGGRESSIVE HTML FORMATTING ENHANCEMENT: Clean up HTML entities, convert emoji codes,
-        and dramatically improve spacing for Zendesk readability using HTML bold tags for headers.
-        ENHANCEMENTS: Pattern-based section detection with <b>bold headers</b>, aggressive header spacing,
-        list formatting, main title formatting, and regression analysis separation to match Slack UI output quality.
+        EMOJI DECODING + SPACING ENHANCEMENT: Clean up HTML entities, convert emoji codes,
+        and improve spacing for Zendesk readability using horizontal rule separators.
+        ENHANCEMENTS: Pattern-based section detection with --- horizontal rules between sections,
+        aggressive header spacing, list formatting preservation, and regression analysis separation.
         """
         import html
 
@@ -818,8 +818,8 @@ class ZendeskClient:
             # Add proper spacing after colons in regression analysis
             regression_section = re.sub(r'([a-zA-Z]):\n([^\n])', r'\1:\n\n\2', regression_section)
 
-            # Combine with main response using visual separator
-            text = main_response + '\n\n' + regression_section
+            # Combine with main response using visual separator (horizontal rule)
+            text = main_response + '\n\n---\n\n' + regression_section
         else:
             text = main_response
 
@@ -915,10 +915,10 @@ class ZendeskWebhookHandler:
     @staticmethod
     def format_for_zendesk(text: str) -> str:
         """
-        EMOJI DECODING + AGGRESSIVE HTML FORMATTING ENHANCEMENT: Clean up HTML entities, convert emoji codes,
-        and dramatically improve spacing for Zendesk readability using HTML bold tags for headers.
-        ENHANCEMENTS: Pattern-based section detection with <b>bold headers</b>, aggressive header spacing,
-        list formatting, main title formatting, and regression analysis separation to match Slack UI output quality.
+        EMOJI DECODING + SPACING ENHANCEMENT: Clean up HTML entities, convert emoji codes,
+        and improve spacing for Zendesk readability using horizontal rule separators.
+        ENHANCEMENTS: Pattern-based section detection with --- horizontal rules between sections,
+        aggressive header spacing, list formatting preservation, and regression analysis separation.
         """
         import html
 
@@ -984,12 +984,13 @@ class ZendeskWebhookHandler:
                 regression_section = pattern + parts[1]
                 break
 
-        # IMPROVEMENT 2: AGGRESSIVE section header detection and formatting
+        # IMPROVEMENT 2: SECTION SPACING WITH HORIZONTAL RULES (NO HTML)
+        # Use horizontal rules (---) for visual breaks between sections
         # Pattern 1: "What X does" / "What Y can do" style headers - MOST CRITICAL
-        main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n---\n\n\2\n\n', main_response)
+        main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n---\n\n\2\n', main_response)
 
         # Pattern 2: All caps headers followed by colon: "SECTION:"
-        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n<b>\2</b>\n\n', main_response)
+        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n---\n\n\2\n', main_response)
 
         # Pattern 3: Common section headers - "Past similar cases", "Still open:", "Solved or closed", "Closed in", etc.
         common_headers = [
@@ -1005,11 +1006,7 @@ class ZendeskWebhookHandler:
             r'Nordea, ticket',
         ]
         for header_pattern in common_headers:
-            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n<b>\2</b>\n\n', main_response)
-
-        # CRITICAL FIX: Format the main title at the beginning if present
-        # Detect title pattern: "Title" or "Title (context)" at start, before first section
-        main_response = re.sub(r'^([A-Z][^\n]+)\n\n', r'<b>\1</b>\n\n', main_response)
+            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n---\n\n\2\n', main_response)
 
         # Pattern 4: Add spacing around known major section keywords (Why, Summary, etc.)
         major_keywords = ['Why', 'Summary', 'Recommended', 'Result', 'Example', 'Note', 'Important', 'Status', 'Reference', 'Solution', 'Support-managed', 'Default role']
