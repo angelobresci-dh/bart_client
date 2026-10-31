@@ -702,131 +702,125 @@ class ZendeskClient:
     @staticmethod
     def format_for_zendesk(text: str) -> str:
         """
-        EMOJI DECODING + SPACING ENHANCEMENT: Clean up HTML entities, convert emoji codes,
-        and improve spacing for Zendesk readability using horizontal rule separators.
-        ENHANCEMENTS: Pattern-based section detection with --- horizontal rules between sections,
-        aggressive header spacing, list formatting preservation, and regression analysis separation.
+        COMPREHENSIVE HTML FORMATTING: Convert plain text response to rich HTML with proper
+        list rendering, section headers, horizontal rules, and code formatting.
+        Outputs HTML that renders like Slack in Zendesk's rich text editor.
         """
-        import html
+        import html as html_module
 
         # Decode HTML entities
-        text = html.unescape(text)
+        text = html_module.unescape(text)
 
         # Convert emoji codes
         emoji_map = {
-            ':dart:': '🎯',
-            ':books:': '📚',
-            ':ticket:': '🎫',
-            ':studio_microphone:': '🎙️',
-            ':bar_chart:': '📊',
-            ':paperclip:': '📎',
-            ':link:': '🔗',
-            ':wrench:': '🔧',
-            ':warning:': '⚠️',
-            ':bulb:': '💡',
-            ':white_check_mark:': '✅',
-            ':x:': '❌',
-            ':fire:': '🔥',
-            ':robot_face:': '🤖',
-            ':speech_balloon:': '💬',
-            ':football:': '🏈',
-            ':soccer:': '⚽',
-            ':basketball:': '🏀',
-            ':hammer:': '🔨',
-            ':gear:': '⚙️',
-            ':computer:': '💻',
-            ':chart_with_upwards_trend:': '📈',
-            ':calendar:': '📅',
-            ':hourglass_flowing_sand:': '⏳',
-            ':lock:': '🔒',
-            ':unlock:': '🔓',
-            ':red_circle:': '🔴',
-            ':clipboard:': '📋',
-            ':date:': '📅',
-            ':busts_in_silhouette:': '👥',
-            ':bustsinsilhouette:': '👥',
-            ':zap:': '⚡',
-            ':shield:': '🛡️',
-            ':repeat:': '🔁',
-            ':large_yellow_circle:': '🟡',
-            ':large_green_circle:': '🟢',
-            ':largeyellowcircle:': '🟡',
-            ':largegreencircle:': '🟢',
-            ':rotating_light:': '🚨',
-            ':label:': '🏷️',
+            ':dart:': '🎯', ':books:': '📚', ':ticket:': '🎫', ':studio_microphone:': '🎙️',
+            ':bar_chart:': '📊', ':paperclip:': '📎', ':link:': '🔗', ':wrench:': '🔧',
+            ':warning:': '⚠️', ':bulb:': '💡', ':white_check_mark:': '✅', ':x:': '❌',
+            ':fire:': '🔥', ':robot_face:': '🤖', ':speech_balloon:': '💬', ':football:': '🏈',
+            ':soccer:': '⚽', ':basketball:': '🏀', ':hammer:': '🔨', ':gear:': '⚙️',
+            ':computer:': '💻', ':chart_with_upwards_trend:': '📈', ':calendar:': '📅',
+            ':hourglass_flowing_sand:': '⏳', ':lock:': '🔒', ':unlock:': '🔓', ':red_circle:': '🔴',
+            ':clipboard:': '📋', ':date:': '📅', ':busts_in_silhouette:': '👥', ':bustsinsilhouette:': '👥',
+            ':zap:': '⚡', ':shield:': '🛡️', ':repeat:': '🔁', ':large_yellow_circle:': '🟡',
+            ':large_green_circle:': '🟢', ':largeyellowcircle:': '🟡', ':largegreencircle:': '🟢',
+            ':rotating_light:': '🚨', ':label:': '🏷️',
         }
         for code, emoji in emoji_map.items():
             text = text.replace(code, emoji)
 
-        # STEP 1: Split by regression analysis section FIRST
-        regression_patterns = ['## Regression Analysis', '## REGRESSION ANALYSIS', '## Regression analysis']
-        regression_section = None
-        main_response = text
+        # Split text into lines for processing
+        lines = text.split('\n')
+        html_output = []
+        i = 0
 
-        for pattern in regression_patterns:
-            if pattern in text:
-                parts = text.split(pattern, 1)
-                main_response = parts[0].rstrip()
-                regression_section = pattern + parts[1]
-                break
+        while i < len(lines):
+            line = lines[i].rstrip()
 
-        # STEP 2: SECTION HEADER SPACING (NO HTML - preserves bullets and numbers)
-        # Add spacing around headers without HTML tags to preserve Zendesk list formatting
-        # Pattern 1: "What X does" / "What Y can do" style headers - MOST CRITICAL
-        main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n\2\n', main_response)
+            # Skip empty lines but track them for spacing
+            if not line:
+                i += 1
+                continue
 
-        # Pattern 2: All caps headers followed by colon: "SECTION:"
-        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n\2\n', main_response)
+            # Detect section headers and wrap in bold
+            if line and not line.startswith(('- ', '• ', '* ')) and not re.match(r'^\d+\.\s', line):
+                # Check if this looks like a section header
+                if any(line.strip().endswith(':') for _ in [1]) or line in [
+                    'Main response', 'What the code does', 'What the customer can do',
+                    'Past issues', 'Past cases', 'Past similar cases', 'Proposed change',
+                    'Proposed change for Support', 'Second section: regression analysis',
+                    'Options for the customer', 'Still open', 'Solved or closed',
+                    'Closed in Linear', 'Related references', 'Corrections to the earlier answer'
+                ] or re.match(r'^(What|Past|Proposed|Closed|Still|Solved|Related|Open|Second)', line):
+                    # This is a section header
+                    html_output.append(f'<b>{html_module.escape(line)}</b>')
+                    html_output.append('')  # spacing
+                elif line == '---' or line.startswith('---'):
+                    # Horizontal rule
+                    html_output.append('<hr />')
+                else:
+                    # Regular paragraph text
+                    # Escape HTML but preserve backtick code formatting
+                    escaped_line = html_module.escape(line)
+                    # Convert `code` to <code>code</code>
+                    escaped_line = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped_line)
+                    html_output.append(escaped_line)
 
-        # Pattern 3: Common section headers - "Past similar cases", "Still open:", "Solved or closed", "Closed in", etc.
-        common_headers = [
-            r'Past similar cases',
-            r'Still open:?',
-            r'Solved or closed',
-            r'Closed in',
-            r'Proposal for',
-            r'Forward Financing',
-            r'Stepstone',
-            r'Chalhoub',
-            r'Nordea',
-            r'Nordea, ticket',
-        ]
-        for header_pattern in common_headers:
-            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n\2\n', main_response)
+            # Detect bullet lists
+            elif line.startswith(('- ', '• ', '* ')):
+                # Collect all bullet items in this list
+                bullet_items = []
+                while i < len(lines):
+                    curr = lines[i].rstrip()
+                    if curr.startswith(('- ', '• ', '* ')):
+                        # Remove the bullet marker and get the content
+                        item_text = re.sub(r'^[-•*]\s+', '', curr)
+                        escaped_item = html_module.escape(item_text)
+                        # Convert `code` to <code>code</code>
+                        escaped_item = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped_item)
+                        bullet_items.append(f'<li>{escaped_item}</li>')
+                        i += 1
+                    else:
+                        break
 
-        # Pattern 4: Add spacing around known major section keywords (Why, Summary, etc.)
-        major_keywords = ['Why', 'Summary', 'Recommended', 'Result', 'Example', 'Note', 'Important', 'Status', 'Reference', 'Solution', 'Support-managed', 'Default role']
-        for keyword in major_keywords:
-            main_response = re.sub(rf'([^\n])\n({keyword}[^\n]*:)', r'\1\n\n\2', main_response)
+                if bullet_items:
+                    html_output.append('<ul>')
+                    html_output.extend(bullet_items)
+                    html_output.append('</ul>')
+                    html_output.append('')  # spacing
+                continue
 
-        # Pattern 5: Add double spacing after colons that end section headers (but not after --- dividers)
-        main_response = re.sub(r'([A-Z][a-zA-Z\s]+):\n([^\-\n])', r'\1:\n\n\2', main_response)
+            # Detect numbered lists
+            elif re.match(r'^\d+\.\s', line):
+                # Collect all numbered items in this list
+                numbered_items = []
+                while i < len(lines):
+                    curr = lines[i].rstrip()
+                    if re.match(r'^\d+\.\s', curr):
+                        # Remove the number marker and get the content
+                        item_text = re.sub(r'^\d+\.\s+', '', curr)
+                        escaped_item = html_module.escape(item_text)
+                        # Convert `code` to <code>code</code>
+                        escaped_item = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped_item)
+                        numbered_items.append(f'<li>{escaped_item}</li>')
+                        i += 1
+                    else:
+                        break
 
-        # Pattern 6: Improve list item spacing - ensure double spacing before dash items
-        main_response = re.sub(r'([^\n-])\n(-\s+[^\n]+)', r'\1\n\n\2', main_response)
+                if numbered_items:
+                    html_output.append('<ol>')
+                    html_output.extend(numbered_items)
+                    html_output.append('</ol>')
+                    html_output.append('')  # spacing
+                continue
 
-        # Pattern 7: Add spacing after numbered items (1., 2., 3., etc.)
-        main_response = re.sub(r'(\d+\.\s+[^\n]+)\n([^\n\d])', r'\1\n\n\2', main_response)
+            i += 1
 
-        # STEP 3: Handle regression analysis section separately
-        if regression_section:
-            regression_section = regression_section.strip()
+        # Join with line breaks and clean up
+        result = '\n'.join(html_output)
+        # Remove excessive spacing
+        result = re.sub(r'\n\n\n+', '\n\n', result)
 
-            # Add double newline before "Percentage" and "Reasoning"
-            regression_section = re.sub(r'([^\n])\n(Percentage|Reasoning)', r'\1\n\n\2', regression_section)
-
-            # Add proper spacing after colons in regression analysis
-            regression_section = re.sub(r'([a-zA-Z]):\n([^\n])', r'\1:\n\n\2', regression_section)
-
-            # Combine with main response using visual separator (horizontal rule)
-            text = main_response + '\n\n---\n\n' + regression_section
-        else:
-            text = main_response
-
-        # STEP 4: Clean up: collapse excessive newlines (max 2) and remove leading/trailing whitespace
-        text = re.sub(r'\n\n\n+', '\n\n', text)
-
-        return text.strip()
+        return result.strip()
 
     def add_comment(self, ticket_id: int, comment_text: str, public: bool = True):
         """Add comment to ticket - APPLIES FORMATTING for improved readability"""
@@ -971,77 +965,93 @@ class ZendeskWebhookHandler:
         for code, emoji in emoji_map.items():
             text = text.replace(code, emoji)
 
-        # IMPROVEMENT 1: Split by regression analysis section FIRST
-        # This prevents double-spacing issues in the analysis section
-        regression_patterns = ['## Regression Analysis', '## REGRESSION ANALYSIS', '## Regression analysis']
-        regression_section = None
-        main_response = text
+        # Split text into lines for HTML processing
+        lines = text.split('\n')
+        html_output = []
+        i = 0
 
-        for pattern in regression_patterns:
-            if pattern in text:
-                parts = text.split(pattern, 1)
-                main_response = parts[0].rstrip()
-                regression_section = pattern + parts[1]
-                break
+        while i < len(lines):
+            line = lines[i].rstrip()
 
-        # IMPROVEMENT 2: SECTION SPACING WITH HORIZONTAL RULES (NO HTML)
-        # Use horizontal rules (---) for visual breaks between sections
-        # Pattern 1: "What X does" / "What Y can do" style headers - MOST CRITICAL
-        main_response = re.sub(r'([^\n])\n(What\s+[^\n]+)\n', r'\1\n\n---\n\n\2\n', main_response)
+            # Skip empty lines
+            if not line:
+                i += 1
+                continue
 
-        # Pattern 2: All caps headers followed by colon: "SECTION:"
-        main_response = re.sub(r'([^\n])\n([A-Z][A-Z\s]+:)\n', r'\1\n\n---\n\n\2\n', main_response)
+            # Detect section headers and wrap in bold
+            if line and not line.startswith(('- ', '• ', '* ')) and not re.match(r'^\d+\.\s', line):
+                # Check if this looks like a section header
+                if any(line.strip().endswith(':') for _ in [1]) or line in [
+                    'Main response', 'What the code does', 'What the customer can do',
+                    'Past issues', 'Past cases', 'Past similar cases', 'Proposed change',
+                    'Proposed change for Support', 'Second section: regression analysis',
+                    'Options for the customer', 'Still open', 'Solved or closed',
+                    'Closed in Linear', 'Related references', 'Corrections to the earlier answer'
+                ] or re.match(r'^(What|Past|Proposed|Closed|Still|Solved|Related|Open|Second)', line):
+                    # Section header
+                    import html as html_module
+                    html_output.append(f'<b>{html_module.escape(line)}</b>')
+                    html_output.append('')
+                elif line == '---' or line.startswith('---'):
+                    html_output.append('<hr />')
+                else:
+                    # Regular paragraph
+                    import html as html_module
+                    escaped_line = html_module.escape(line)
+                    escaped_line = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped_line)
+                    html_output.append(escaped_line)
 
-        # Pattern 3: Common section headers - "Past similar cases", "Still open:", "Solved or closed", "Closed in", etc.
-        common_headers = [
-            r'Past similar cases',
-            r'Still open:?',
-            r'Solved or closed',
-            r'Closed in',
-            r'Proposal for',
-            r'Forward Financing',
-            r'Stepstone',
-            r'Chalhoub',
-            r'Nordea',
-            r'Nordea, ticket',
-        ]
-        for header_pattern in common_headers:
-            main_response = re.sub(rf'([^\n])\n({header_pattern}[^\n]*)\n', r'\1\n\n---\n\n\2\n', main_response)
+            # Detect bullet lists
+            elif line.startswith(('- ', '• ', '* ')):
+                bullet_items = []
+                while i < len(lines):
+                    curr = lines[i].rstrip()
+                    if curr.startswith(('- ', '• ', '* ')):
+                        item_text = re.sub(r'^[-•*]\s+', '', curr)
+                        import html as html_module
+                        escaped_item = html_module.escape(item_text)
+                        escaped_item = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped_item)
+                        bullet_items.append(f'<li>{escaped_item}</li>')
+                        i += 1
+                    else:
+                        break
 
-        # Pattern 4: Add spacing around known major section keywords (Why, Summary, etc.)
-        major_keywords = ['Why', 'Summary', 'Recommended', 'Result', 'Example', 'Note', 'Important', 'Status', 'Reference', 'Solution', 'Support-managed', 'Default role']
-        for keyword in major_keywords:
-            main_response = re.sub(rf'([^\n])\n({keyword}[^\n]*:)', r'\1\n\n\2', main_response)
+                if bullet_items:
+                    html_output.append('<ul>')
+                    html_output.extend(bullet_items)
+                    html_output.append('</ul>')
+                    html_output.append('')
+                continue
 
-        # Pattern 5: Add double spacing after colons that end section headers (but not after --- dividers)
-        main_response = re.sub(r'([A-Z][a-zA-Z\s]+):\n([^\-\n])', r'\1:\n\n\2', main_response)
+            # Detect numbered lists
+            elif re.match(r'^\d+\.\s', line):
+                numbered_items = []
+                while i < len(lines):
+                    curr = lines[i].rstrip()
+                    if re.match(r'^\d+\.\s', curr):
+                        item_text = re.sub(r'^\d+\.\s+', '', curr)
+                        import html as html_module
+                        escaped_item = html_module.escape(item_text)
+                        escaped_item = re.sub(r'`([^`]+)`', r'<code>\1</code>', escaped_item)
+                        numbered_items.append(f'<li>{escaped_item}</li>')
+                        i += 1
+                    else:
+                        break
 
-        # Pattern 6: Improve list item spacing - ensure double spacing before dash items
-        main_response = re.sub(r'([^\n-])\n(-\s+[^\n]+)', r'\1\n\n\2', main_response)
+                if numbered_items:
+                    html_output.append('<ol>')
+                    html_output.extend(numbered_items)
+                    html_output.append('</ol>')
+                    html_output.append('')
+                continue
 
-        # Pattern 7: Add spacing after numbered items (1., 2., 3., etc.)
-        main_response = re.sub(r'(\d+\.\s+[^\n]+)\n([^\n\d])', r'\1\n\n\2', main_response)
+            i += 1
 
-        # IMPROVEMENT 3: Handle regression analysis section separately
-        if regression_section:
-            # Ensure proper spacing at the start of regression section
-            regression_section = regression_section.strip()
+        # Join and clean up
+        result = '\n'.join(html_output)
+        result = re.sub(r'\n\n\n+', '\n\n', result)
 
-            # Add double newline before "Percentage" and "Reasoning" in regression analysis
-            regression_section = re.sub(r'([^\n])\n(Percentage|Reasoning)', r'\1\n\n\2', regression_section)
-
-            # Add proper spacing after colons in regression analysis
-            regression_section = re.sub(r'([a-zA-Z]):\n([^\n])', r'\1:\n\n\2', regression_section)
-
-            # Combine with main response
-            text = main_response + '\n\n---\n\n' + regression_section
-        else:
-            text = main_response
-
-        # IMPROVEMENT 4: Normalize multiple consecutive newlines to max 2
-        text = re.sub(r'\n\n\n+', '\n\n', text)
-
-        return text.strip()
+        return result.strip()
     
     def verify_signature(self, body: bytes, signature: str) -> bool:
         """Verify webhook signature"""
