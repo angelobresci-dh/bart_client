@@ -29,6 +29,9 @@ Environment Variables:
     PROCESSING_HISTORY_TTL - Default: 3600 (1 hour)
     TEST_PROCESSING_TTL - Default: 300 (5 minutes for test endpoint)
     BART_COMMENT_CHECK_HOURS - Default: 24
+    BART_MAX_CONTINUATIONS - Times to reply "continue" when Bart hits its turn limit. Default: 3
+    BART_CONTINUE_EXTRA_TIMEOUT - Extra seconds of wait time added per continuation. Default: 600
+    BART_CONTINUE_TEXT - Reply text sent to Bart (after an @mention). Default: "continue"
 """
 import asyncio
 import os
@@ -415,12 +418,25 @@ def build_zendesk_html_comment(body_html: str, title: str, footer: str,
     return "".join(parts)
 
 
+class BartIncompleteError(Exception):
+    """Bart stopped before finishing (for example, it kept hitting its turn limit)."""
+
+
 class BartClient:
     """Async Bart client using WebSocket (Socket Mode) with smart message collection"""
     BART_USER_ID = "U09RYUJDUQL"
-    
+
+    # Bart's notice when its agent runs out of turns, e.g.
+    # "You hit the 50-turn limit while working. The task is incomplete. Reply continue to resume from this session."
+    TURN_LIMIT_PATTERN = re.compile(
+        r"hit the \d+[- ]turn limit|turn limit while working|reply\s+[`*_]*continue[`*_]*\s+to resume",
+        re.IGNORECASE,
+    )
+
     def __init__(self, bot_token: str, app_token: str, channel_id: str, zendesk_subdomain: str,
-                 timeout: float = 600.0, completion_wait: float = 120.0, fallback_wait: float = 540.0):
+                 timeout: float = 600.0, completion_wait: float = 120.0, fallback_wait: float = 540.0,
+                 max_continuations: int = 3, continuation_extra_time: float = 600.0,
+                 continue_text: str = "continue"):
         self.client = AsyncWebClient(token=bot_token)
         self.app = AsyncApp(token=bot_token)
         self.app_token = app_token
@@ -429,6 +445,10 @@ class BartClient:
         self.default_timeout = timeout
         self.completion_wait = completion_wait
         self.fallback_wait = fallback_wait
+        # Turn-limit handling: reply "continue" in the thread up to N times
+        self.max_continuations = max_continuations
+        self.continuation_extra_time = continuation_extra_time
+        self.continue_text = continue_text
         self.handler: Optional[AsyncSocketModeHandler] = None
         self.pending_responses = {}
         self.active_tickets = set()
@@ -487,8 +507,16 @@ class BartClient:
             await self.handler.close_async()
             logger.info(":x: Disconnected from Slack")
     
+    def is_turn_limit_message(self, text: str) -> bool:
+        """Detect Bart's 'You hit the N-turn limit ... Reply continue to resume' notice"""
+        return bool(text) and bool(self.TURN_LIMIT_PATTERN.search(text))
+
     def is_working_message(self, text: str) -> bool:
         """Detect if message is a working status update"""
+        # A turn-limit notice means Bart is NOT done; never treat it as an answer
+        if self.is_turn_limit_message(text):
+            return True
+
         final_indicators = [
             "All repos already up-to-date",
             ":white_check_mark: All repos already up-to-date"
@@ -520,6 +548,9 @@ class BartClient:
     
     def is_final_message(self, text: str) -> bool:
         """Detect if message is a final response"""
+        if self.is_turn_limit_message(text):
+            return False
+
         final_indicators = [
             "All repos already up-to-date",
             ":white_check_mark: All repos already up-to-date",
@@ -762,25 +793,62 @@ class BartClient:
             if not messages:
                 await asyncio.sleep(1)
                 continue
-            
-            last_message_time = self.pending_responses[thread_ts]["last_message_time"]
+
+            state = self.pending_responses[thread_ts]
+
+            # TURN LIMIT: if Bart's latest message says it hit its turn limit,
+            # reply "continue" in the thread so it resumes, and keep waiting.
+            latest = max(messages, key=lambda m: float(m["ts"]))
+            continued = state.setdefault("continued_ts", set())
+            if self.is_turn_limit_message(latest["text"]) and latest["ts"] not in continued:
+                continued.add(latest["ts"])
+                state["continuations"] = state.get("continuations", 0) + 1
+                state["resume_after_ts"] = float(latest["ts"])
+                if state["continuations"] > self.max_continuations:
+                    raise BartIncompleteError(
+                        f"Bart hit its turn limit {state['continuations']} times and did not finish "
+                        f"(max continuations: {self.max_continuations})"
+                    )
+                await self._send_continue(thread_ts, request_id, state["continuations"])
+                timeout += self.continuation_extra_time  # give the resumed run time to finish
+                state["last_message_time"] = time.time()
+                continue
+
+            last_message_time = state["last_message_time"]
             time_since_last = time.time() - last_message_time
-            has_final = any(msg["is_final"] for msg in messages)
-            
+            # After a "continue", only an answer posted AFTER the limit notice counts as done
+            resume_after = state.get("resume_after_ts", 0.0)
+            has_final = any(msg["is_final"] and float(msg["ts"]) > resume_after for msg in messages)
+
             if has_final and time_since_last > self.completion_wait:
                 logger.info(f":white_check_mark: [{request_id}] Bart done (no messages for {time_since_last:.1f}s)")
                 return
-            
+
             if time_since_last > self.fallback_wait:
+                if self.is_turn_limit_message(latest["text"]) or (resume_after and not has_final):
+                    raise BartIncompleteError(
+                        f"Bart did not resume after its turn limit (no messages for {time_since_last:.0f}s)"
+                    )
                 logger.warning(f":warning: [{request_id}] No messages for {time_since_last:.1f}s")
                 return
-            
+
             await asyncio.sleep(2)
+
+    async def _send_continue(self, thread_ts: str, request_id: str, attempt: int):
+        """Reply in Bart's thread so it resumes after hitting its turn limit."""
+        text = f"<@{self.BART_USER_ID}> {self.continue_text}"
+        logger.warning(f":repeat: [{request_id}] Bart hit its turn limit - replying '{self.continue_text}' "
+                       f"(continuation {attempt}/{self.max_continuations})")
+        await self.client.chat_postMessage(channel=self.channel_id, thread_ts=thread_ts, text=text)
     
     def _select_response_messages(self, thread_ts: str) -> list:
         """Pick Bart's final messages (or the meaningful ones if none are marked final)."""
         request_id = self.pending_responses[thread_ts].get("request_id", "unknown")
-        messages = self.pending_responses[thread_ts]["messages"]
+        # Never include Bart's turn-limit notices in the answer
+        messages = [m for m in self.pending_responses[thread_ts]["messages"]
+                    if not self.is_turn_limit_message(m["text"])]
+        if not messages:
+            raise BartIncompleteError("Bart only returned a turn-limit notice, no answer")
 
         final_messages = [msg for msg in messages if msg["is_final"]]
         if final_messages:
@@ -894,6 +962,7 @@ class BartClient:
             raise ValueError(f"Ticket {ticket_id} already being processed")
         
         self.active_tickets.add(ticket_id)
+        incomplete = False
         logger.info(f":lock: [{request_id}] Locked ticket {ticket_id}")
         
         try:
@@ -1059,11 +1128,18 @@ class BartClient:
                     "ticket_id": self.pending_responses[message_ts]["ticket_id"],
                     "slack_thread_url": thread_url
                 }
+            except BartIncompleteError:
+                incomplete = True
+                raise
             finally:
                 self.pending_responses.pop(message_ts, None)
         finally:
             self.active_tickets.discard(ticket_id)
-            self.mark_as_processed(ticket_id)
+            if incomplete:
+                # Don't block a retry: the ticket was not answered
+                logger.info(f":repeat: [{request_id}] Ticket {ticket_id} NOT marked processed (Bart incomplete)")
+            else:
+                self.mark_as_processed(ticket_id)
             logger.info(f":unlock: [{request_id}] Unlocked ticket {ticket_id}")
 
 
@@ -1506,6 +1582,25 @@ Instructions and rules for your response:
                 "tag_added": False  # CRITICAL: No tag on timeout
             }
         
+        except BartIncompleteError as e:
+            logger.error(f":repeat: [{request_id}] Bart did not finish: {e}")
+            # NO TAG ADDED - Bart's answer is incomplete, so automation can retry
+            if add_comment:
+                self.zendesk.add_comment(
+                    ticket_id=ticket_id,
+                    comment_text=(f"⚠️ Bart could not finish this ticket: {e}. "
+                                  f"No answer was posted and the ticket was not tagged bart-bot-processed, "
+                                  f"so it can be retried."),
+                    public=False
+                )
+            return {
+                "status": "incomplete",
+                "ticket_id": ticket_id,
+                "error": str(e),
+                "comment_added": add_comment,
+                "tag_added": False
+            }
+
         except Exception as e:
             logger.error(f":x: [{request_id}] Error: {e}")
             # NO TAG ADDED - processing failed
@@ -1630,6 +1725,9 @@ async def startup_event():
     processing_history_ttl = float(os.getenv("PROCESSING_HISTORY_TTL", "3600"))
     test_processing_ttl = float(os.getenv("TEST_PROCESSING_TTL", "300"))
     bart_comment_check_hours = int(os.getenv("BART_COMMENT_CHECK_HOURS", "24"))
+    bart_max_continuations = int(os.getenv("BART_MAX_CONTINUATIONS", "3"))
+    bart_continue_extra_timeout = float(os.getenv("BART_CONTINUE_EXTRA_TIMEOUT", "600"))
+    bart_continue_text = os.getenv("BART_CONTINUE_TEXT", "continue")
     
     required = {
         "SLACK_BOT_TOKEN": bot_token,
@@ -1659,7 +1757,10 @@ async def startup_event():
         zendesk_subdomain=zendesk_subdomain,
         timeout=bart_timeout,
         completion_wait=bart_completion_wait,
-        fallback_wait=bart_fallback_wait
+        fallback_wait=bart_fallback_wait,
+        max_continuations=bart_max_continuations,
+        continuation_extra_time=bart_continue_extra_timeout,
+        continue_text=bart_continue_text
     )
     
     bart_client.processing_history_ttl = processing_history_ttl
