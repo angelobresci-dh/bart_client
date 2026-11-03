@@ -9,7 +9,7 @@ Combines original job tracking with today's improvements:
 - bart-bot-processed tag on successful comment posting
 
 Requirements:
-    pip install fastapi uvicorn slack-bolt slack-sdk python-dotenv zenpy aiohttp
+    pip install fastapi uvicorn slack-bolt slack-sdk python-dotenv zenpy aiohttp requests
 
 Environment Variables:
     SLACK_BOT_TOKEN - Slack Bot User OAuth Token (xoxb-...)
@@ -17,8 +17,10 @@ Environment Variables:
     SLACK_CHANNEL_ID - Channel ID OR
     SLACK_CHANNEL_NAME - Channel name
     ZENDESK_SUBDOMAIN - Your Zendesk subdomain
-    ZENDESK_EMAIL - Zendesk admin email
-    ZENDESK_API_TOKEN - Zendesk API token
+    ZENDESK_OAUTH_CLIENT_ID - Zendesk OAuth client "Identifier" (confidential client)
+    ZENDESK_OAUTH_CLIENT_SECRET - Zendesk OAuth client secret
+    ZENDESK_OAUTH_SCOPE - Optional: token scope. Default: "read write"
+    ZENDESK_OAUTH_TOKEN_TTL - Optional: token lifetime in seconds (300-172800). Default: 7200
     ZENDESK_WEBHOOK_SECRET - Optional: Webhook signature secret
     PUBLIC_URL - Optional: Public URL
     BART_TIMEOUT - Default: 600
@@ -34,7 +36,9 @@ import re
 import hashlib
 import hmac
 import time
+import threading
 import uuid
+import requests
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
@@ -1063,57 +1067,150 @@ class BartClient:
             logger.info(f":unlock: [{request_id}] Unlocked ticket {ticket_id}")
 
 
-class ZendeskClient:
-    """Zendesk API client"""
-    
-    def __init__(self, subdomain: str, email: str, token: str):
-        # IMPROVEMENT 5: Increased timeout to 120s
-        self.zenpy_client = Zenpy(
-            subdomain=subdomain,
-            email=email,
-            token=token,
-            timeout=120
-        )
+class ZendeskAuthError(Exception):
+    """Raised when an OAuth access token cannot be obtained from Zendesk."""
 
+
+class ZendeskClient:
+    """Zendesk API client using OAuth (client credentials grant).
+
+    Gets an access token from https://{subdomain}.zendesk.com/oauth/tokens with the
+    OAuth client's ID and secret. Client-credentials tokens have no refresh token,
+    so a new token is requested shortly before the current one expires, and once
+    more if Zendesk answers 401. The token acts as the admin who created the client.
+    """
+
+    TOKEN_REFRESH_MARGIN = 300        # renew 5 minutes before expiry
+    MIN_TTL, MAX_TTL = 300, 172800    # Zendesk limits for expires_in
+    NO_EXPIRY_RECHECK = 86400         # if Zendesk returns no expiry, renew daily anyway
+
+    def __init__(self, subdomain: str, client_id: str, client_secret: str,
+                 scope: str = "read write", token_ttl: int = 7200):
+        if not (subdomain and client_id and client_secret):
+            raise ZendeskAuthError("Zendesk subdomain, OAuth client ID and client secret are required")
+        self.subdomain = subdomain
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self.scope = scope
+        self.token_ttl = max(self.MIN_TTL, min(int(token_ttl), self.MAX_TTL))
+        self._token_url = f"https://{subdomain}.zendesk.com/oauth/tokens"
+        self._lock = threading.Lock()
+        self._zenpy = None
+        self._token_expires_at = 0.0
+        # Fail fast at startup if the credentials are wrong
+        self._refresh_token(reason="startup")
+
+    # ------------------------------------------------------------------ OAuth
+    def _refresh_token(self, reason: str = "expiry"):
+        """Request a new access token and rebuild the Zenpy client."""
+        payload = {
+            "grant_type": "client_credentials",
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+            "scope": self.scope,
+            "expires_in": self.token_ttl,
+        }
+        try:
+            resp = requests.post(self._token_url, json=payload, timeout=30)
+        except requests.RequestException as e:
+            raise ZendeskAuthError(f"Could not reach Zendesk OAuth endpoint: {e}") from e
+
+        if resp.status_code not in (200, 201):
+            # Log Zendesk's error code only; never the request (it holds the secret)
+            try:
+                err = resp.json()
+                detail = f"{err.get('error', '')}: {err.get('error_description', '')}".strip(": ")
+            except ValueError:
+                detail = resp.text[:200]
+            raise ZendeskAuthError(f"Zendesk OAuth token request failed (HTTP {resp.status_code}): {detail}")
+
+        data = resp.json()
+        access_token = data.get("access_token")
+        if not access_token:
+            raise ZendeskAuthError("Zendesk OAuth response did not include an access_token")
+
+        expires_in = data.get("expires_in")
+        lifetime = float(expires_in) if expires_in else float(self.NO_EXPIRY_RECHECK)
+        self._token_expires_at = time.time() + lifetime
+        # IMPROVEMENT 5: 120s timeout for Zendesk API calls
+        self._zenpy = Zenpy(subdomain=self.subdomain, oauth_token=access_token, timeout=120)
+        logger.info(f":key: Zendesk OAuth token obtained ({reason}); scope='{data.get('scope', self.scope)}', "
+                    f"expires in {int(lifetime)}s")
+
+    def _ensure_token(self, force: bool = False):
+        with self._lock:
+            if force or self._zenpy is None or time.time() >= self._token_expires_at - self.TOKEN_REFRESH_MARGIN:
+                self._refresh_token(reason="forced after 401" if force else "expiry")
+
+    @property
+    def zenpy_client(self) -> Zenpy:
+        """Zenpy client with a valid OAuth token (renewed automatically)."""
+        self._ensure_token()
+        return self._zenpy
+
+    @staticmethod
+    def _is_auth_error(e: Exception) -> bool:
+        response = getattr(e, "response", None)
+        if getattr(response, "status_code", None) == 401:
+            return True
+        msg = str(e).lower()
+        return "couldn't authenticate" in msg or "invalid_token" in msg
+
+    def _with_reauth(self, fn):
+        """Run fn(); if Zendesk rejects the token, get a new one and retry once."""
+        try:
+            return fn()
+        except Exception as e:
+            if isinstance(e, ZendeskAuthError) or not self._is_auth_error(e):
+                raise
+            logger.warning(":key: Zendesk returned 401 - requesting a new OAuth token and retrying once")
+            self._ensure_token(force=True)
+            return fn()
+
+    # ------------------------------------------------------------- API calls
     def add_comment(self, ticket_id: int, comment_text: str, public: bool = True,
                     html_body: Optional[str] = None):
         """Add a comment to a ticket.
         If html_body is given it is sent as Zendesk `html_body` (rendered as rich text:
         bold, lists, code, horizontal rules). Otherwise comment_text is sent as `body`."""
-        try:
+        def _do():
             ticket = self.zenpy_client.tickets(id=ticket_id)
             if html_body:
                 ticket.comment = Comment(html_body=html_body, public=public)
             else:
                 ticket.comment = Comment(body=comment_text, public=public)
             self.zenpy_client.tickets.update(ticket)
+        try:
+            self._with_reauth(_do)
             logger.info(f":white_check_mark: Added comment to ticket #{ticket_id}"
                         f" ({'html_body' if html_body else 'body'})")
         except Exception as e:
             logger.error(f":x: Failed to update ticket #{ticket_id}: {e}")
             raise
-    
+
     def get_ticket(self, ticket_id: int) -> Ticket:
         """Get ticket by ID"""
-        return self.zenpy_client.tickets(id=ticket_id)
-    
+        return self._with_reauth(lambda: self.zenpy_client.tickets(id=ticket_id))
+
     def get_organization(self, org_id: int):
         """Get organization by ID"""
         try:
-            return self.zenpy_client.organizations(id=org_id)
+            return self._with_reauth(lambda: self.zenpy_client.organizations(id=org_id))
         except Exception as e:
             logger.warning(f":warning: Failed to get org {org_id}: {e}")
             return None
-    
+
     def has_recent_bart_comment(self, ticket_id: int, within_hours: int = 24) -> bool:
         """Check if Bart commented recently"""
-        try:
+        def _do():
             ticket = self.zenpy_client.tickets(id=ticket_id)
-            comments = self.zenpy_client.tickets.comments(ticket=ticket)
-            
+            return list(self.zenpy_client.tickets.comments(ticket=ticket))
+        try:
+            comments = self._with_reauth(_do)
+
             cutoff_time = datetime.now(timezone.utc) - timedelta(hours=within_hours)
             bart_signature = "This response was automatically generated by Bart"
-            
+
             for comment in comments:
                 if comment.created_at:
                     # Handle both timezone-aware and naive datetimes
@@ -1121,34 +1218,35 @@ class ZendeskClient:
                     if comment_time > cutoff_time:
                         if comment.body and bart_signature in comment.body:
                             return True
-            
+
             return False
         except Exception as e:
             logger.warning(f":warning: Failed to check comments: {e}")
             return False
-    
+
     def add_tag_to_ticket(self, ticket_id: int, tag: str) -> bool:
         """
         Add a tag to a ticket.
         Returns True if successful, False otherwise.
-        
+
         Used to mark tickets after Bart successfully posts a response.
         """
-        try:
+        def _do():
             ticket = self.zenpy_client.tickets(id=ticket_id)
-            
+
             # Get current tags and add new one if not already present
             current_tags = ticket.tags if hasattr(ticket, 'tags') and ticket.tags else []
-            
+
             if tag not in current_tags:
                 current_tags.append(tag)
                 ticket.tags = current_tags
                 self.zenpy_client.tickets.update(ticket)
                 logger.info(f":label: Added tag '{tag}' to ticket #{ticket_id}")
-                return True
             else:
                 logger.info(f":label: Tag '{tag}' already present on ticket #{ticket_id}")
-                return True
+            return True
+        try:
+            return self._with_reauth(_do)
         except Exception as e:
             logger.error(f":x: Failed to add tag '{tag}' to ticket #{ticket_id}: {e}")
             return False
@@ -1520,8 +1618,10 @@ async def startup_event():
     channel_id = os.getenv("SLACK_CHANNEL_ID")
     channel_name = os.getenv("SLACK_CHANNEL_NAME")
     zendesk_subdomain = os.getenv("ZENDESK_SUBDOMAIN")
-    zendesk_email = os.getenv("ZENDESK_EMAIL")
-    zendesk_token = os.getenv("ZENDESK_API_TOKEN")
+    zendesk_client_id = os.getenv("ZENDESK_OAUTH_CLIENT_ID")
+    zendesk_client_secret = os.getenv("ZENDESK_OAUTH_CLIENT_SECRET")
+    zendesk_oauth_scope = os.getenv("ZENDESK_OAUTH_SCOPE", "read write")
+    zendesk_token_ttl = int(os.getenv("ZENDESK_OAUTH_TOKEN_TTL", "7200"))
     webhook_secret = os.getenv("ZENDESK_WEBHOOK_SECRET")
     public_url = os.getenv("PUBLIC_URL")
     bart_timeout = float(os.getenv("BART_TIMEOUT", "600"))
@@ -1531,8 +1631,19 @@ async def startup_event():
     test_processing_ttl = float(os.getenv("TEST_PROCESSING_TTL", "300"))
     bart_comment_check_hours = int(os.getenv("BART_COMMENT_CHECK_HOURS", "24"))
     
-    if not all([bot_token, app_token, zendesk_subdomain, zendesk_email, zendesk_token]):
-        raise ValueError("Missing required environment variables")
+    required = {
+        "SLACK_BOT_TOKEN": bot_token,
+        "SLACK_APP_TOKEN": app_token,
+        "ZENDESK_SUBDOMAIN": zendesk_subdomain,
+        "ZENDESK_OAUTH_CLIENT_ID": zendesk_client_id,
+        "ZENDESK_OAUTH_CLIENT_SECRET": zendesk_client_secret,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
+    if os.getenv("ZENDESK_EMAIL") or os.getenv("ZENDESK_API_TOKEN"):
+        logger.warning(":warning: ZENDESK_EMAIL / ZENDESK_API_TOKEN are set but no longer used "
+                       "(Zendesk auth is OAuth client credentials). You can remove them.")
     
     if not channel_id and not channel_name:
         raise ValueError("Missing channel configuration")
@@ -1556,8 +1667,10 @@ async def startup_event():
     
     zendesk_client = ZendeskClient(
         subdomain=zendesk_subdomain,
-        email=zendesk_email,
-        token=zendesk_token
+        client_id=zendesk_client_id,
+        client_secret=zendesk_client_secret,
+        scope=zendesk_oauth_scope,
+        token_ttl=zendesk_token_ttl
     )
     
     webhook_handler = ZendeskWebhookHandler(
